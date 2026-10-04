@@ -24,9 +24,22 @@ if PROXY:
 
 from binance.client import Client
 
-# ================= 配置区：请填写你的实盘 API Key =================
-API_KEY = "jfDhV6VSdXXr9MNwyPBtZu3zTR94TSLf6X56mRuzsDRyswvRqpLPjyvKZEyL7eKp" # 换成你的实盘 API Key
-API_SECRET = "7bImFpPiFRyQfp3QsuiaOBLKBSJpxdZ36Fj6F3BuxZA7TUX6WHfTN7lLyZ9I4sbv" # 换成你的实盘 API Secret
+# ================= 配置区 =================
+# API 密钥从桌面密钥文件读取，不要写死在代码里
+# 文件路径：C:\Users\Administrator\Desktop\binance_keys.txt
+# 文件内容两行：第一行 API Key，第二行 API Secret
+KEY_FILE = os.path.join(os.path.expanduser("~"), "Desktop", "binance_keys.txt")
+if not os.path.exists(KEY_FILE):
+    print(f"错误：密钥文件不存在 {KEY_FILE}")
+    print("请在桌面创建 binance_keys.txt，第一行写 API Key，第二行写 API Secret")
+    sys.exit(1)
+with open(KEY_FILE, "r", encoding="utf-8-sig") as f:
+    lines = [line.strip() for line in f.readlines() if line.strip()]
+if len(lines) < 2:
+    print("错误：密钥文件格式不对，需要两行：第一行 API Key，第二行 API Secret")
+    sys.exit(1)
+API_KEY = lines[0]
+API_SECRET = lines[1]
 SYMBOL = "BTCUSDT"                                  # 交易对
 INTERVAL = Client.KLINE_INTERVAL_15MINUTE           # 15 分钟 K 线
 FAST_PERIOD = 5                                     # 快线周期
@@ -42,7 +55,7 @@ class ProxiedClient(Client):
         session.trust_env = True  # 从环境变量读取代理
         return session
 
-client = ProxiedClient(API_KEY, API_SECRET, testnet=False)
+client = ProxiedClient(API_KEY, API_SECRET, testnet=False, base_endpoint="1")
 
 
 def close_prices(period):
