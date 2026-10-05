@@ -18,8 +18,8 @@ from bot import client
 FAST = bot.FAST_PERIOD          # 5
 SLOW = bot.SLOW_PERIOD          # 20
 FEE = bot.MAKER_FEE_RATE        # 每边 0.02%（maker）
-BARS = 260                      # 15m×260≈2.7 天，预热 19 根后取最近 192 根（≈2 天）
-PERIOD = 192                    # 回测窗口：最近 2 天
+BARS = 1500                     # 拉取 K 线数量（1m×1500≈25 小时，3 次分页可扩到 3 天）
+PERIOD = 1440                   # 回测窗口：最近 24 小时（1440 根 1 分钟 K 线）
 
 
 def backtest(closes, fast=FAST, slow=SLOW, fee=FEE):
@@ -73,7 +73,7 @@ for sym in cand:
 
 results.sort(key=lambda r: r[1], reverse=True)
 
-print(f"\n=== 双均线策略(15m MA{FAST}/{SLOW}) 最近2天回测 | 成交量前100币 | 手续费每边{FEE*100:.2f}% ===")
+print(f"\n=== 双均线策略({bot.INTERVAL} MA{FAST}/{SLOW}) 最近24小时回测 | 成交量前100币 | 手续费每边{FEE*100:.2f}% ===")
 print(f"{'排名':<4}{'交易对':<10}{'策略收益%':<11}{'买入持有%':<11}{'交易数':<6}{'胜率':<8}{'盈亏比':<8}")
 for i, (sym, ret, bh, n, wins, pf) in enumerate(results[:20], 1):
     mark = " ← 当前" if sym == bot.SYMBOL else ""
