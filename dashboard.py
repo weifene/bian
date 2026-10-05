@@ -9,6 +9,9 @@
   - 读：bot_status.json（状态快照）、scan_results.json（扫描 Top N）、trade_log.json / pnl_history.json
   - 写：open_request.json（开仓请求）、stop_request.flag（停止）、删除 manual_pause.flag（恢复交易）
 
+性能：使用 st.fragment(run_every=...) 局部自动刷新（仅数据区定时重绘），
+不再用 JS 整页刷新，交互不卡顿、所选币种不会被刷新重置。
+
 用法：streamlit run dashboard.py
 """
 import os
@@ -20,7 +23,6 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from streamlit.components.v1 import html
 
 # 代理配置（与 bot.py 保持一致）
 PROXY = "socks5h://127.0.0.1:7892"
@@ -90,17 +92,15 @@ def start_bot():
 # ---------------- 页面选择 ----------------
 
 page = st.sidebar.radio("页面", ["智能操作台", "账户分析"])
-refresh_sec = st.sidebar.slider("自动刷新间隔（秒）", 10, 300, 30)
+refresh_sec = st.sidebar.slider("数据自动刷新间隔（秒）", 10, 120, 30)
+st.sidebar.caption("页面不再整页刷新：仅数据区域按此间隔局部重绘，交互不卡顿、选择不会被重置。")
 
 
 # ================= 智能操作台 =================
 
-if page == "智能操作台":
-    # 定时整页刷新（Streamlit 无内置定时器，用 JS 刷新页面实现自动更新）
-    # 一旦用户勾选"我确认"（进入开仓确认流程），暂停自动刷新——防止刷新把所选币种悄悄重置
-    if not st.session_state.get("hold_refresh"):
-        html(f"""<script>setTimeout(function(){{window.parent.location.reload()}}, {refresh_sec*1000});</script>""", height=0)
-
+@st.fragment(run_every=refresh_sec)
+def status_section():
+    """机器人状态卡片 + 程序控制（局部自动刷新）"""
     st.title("🤖 智能操作台")
     st.caption("机器人空仓时每 2 分钟扫描全市场“干净趋势”目标写入本页；开仓需你确认后由机器人复核并全仓下单，"
                "清仓（趋势破坏 / 止损）始终自动执行。")
@@ -168,7 +168,10 @@ if page == "智能操作台":
     with cc3:
         st.caption("停止/启动不影响已持仓：机器人重启后会按交易记录继续管理持仓。")
 
-    # ---------- 扫描结果 ----------
+
+@st.fragment(run_every=max(15, refresh_sec // 2))
+def scan_section():
+    """扫描结果 + 趋势窗口 + 选择开仓（局部自动刷新，所选币种不会被重置）"""
     st.subheader("🔍 全市场扫描结果（干净趋势 Top 10）")
 
     # ---------- 趋势窗口选择（写入 scan_window.json，机器人每轮读取并生效）----------
@@ -186,14 +189,14 @@ if page == "智能操作台":
     opts = [1, 3, 6, 12]
     w1, w2 = st.columns([1, 4])
     with w1:
-        wh = st.selectbox("趋势窗口（小时）", opts, index=opts.index(cur_window) if cur_window in opts else 3)
+        wh = st.selectbox("趋势窗口（小时）", opts, index=opts.index(cur_window) if cur_window in opts else 3, key="win_sel")
         if wh != cur_window:
             with open(SCAN_WINDOW_FILE, "w", encoding="utf-8") as f:
                 json.dump({"hours": wh}, f)
             st.success(f"已切换为最近 {wh} 小时，机器人下一轮（≤1 秒）生效")
     with w2:
         st.caption(f"当前趋势窗口：最近 **{cur_window} 小时**（扫描选币 / 开仓复核 / 持仓信号统一使用，"
-                   f"对应 {cur_window * 4} 根 15 分钟 K 线）。"
+                   f"按窗口自动选周期保证约 60 根 K 线：1h→1m×60、3h→3m×60、6h→5m×72、12h→15m×48）。"
                    f"窗口越短趋势越灵敏（1 小时适合短线），越长越稳（12 小时过滤噪声）。")
     if scan and scan.get("candidates"):
         cands = scan["candidates"]
@@ -219,12 +222,9 @@ if page == "智能操作台":
         st.caption(f"该币当前为 **{dir_txt}**。开仓实际方向由机器人复核时的实时斜率决定，以机器人判定为准。")
         st.caption("若复核不通过（趋势已不干净 / 资金费率超 0.1% 且逆费率方向），机器人会拒绝开仓并在运行日志中说明原因。")
         agree = st.checkbox("我确认：全仓开单（可用余额 95% × 3 倍杠杆），由机器人复核趋势后自动执行")
-        if agree:
-            st.session_state["hold_refresh"] = True   # 勾选后停止整页刷新，锁定所选币种
         st.caption(f"本次将发送的开仓币种：**{sel}**（请核对与下拉框一致再点击按钮）")
         if st.button(f"✅ 确认开仓 {sel}", type="primary", disabled=not agree, use_container_width=True):
             write_open_request(sel)
-            st.session_state["hold_refresh"] = False  # 请求已发出，恢复自动刷新
             st.success(f"开仓请求已发送（{sel}），机器人将在下一轮（≤1 秒）复核后全仓开单。")
         if os.path.exists(OPEN_REQUEST_FILE):
             st.warning("⚠️ 已有待处理开仓请求，机器人处理前请勿重复发送。"
@@ -234,164 +234,172 @@ if page == "智能操作台":
                 "若正在持仓中，将保留上一次扫描结果或为空。")
         st.caption("提示：机器人仍处于暂停状态时不会扫描，请在下方“程序控制”恢复交易。")
 
-    st.stop()
-
 
 # ================= 账户分析 =================
 
-# 读取交易记录（当前币种以机器人状态快照为准，取不到则用 CARVUSDT）
-status, _ = load_status()
-SYMBOL = status.get("symbol", "CARVUSDT") if status else "CARVUSDT"
-BASE_ASSET = SYMBOL.replace("USDT", "")
+@st.fragment(run_every=refresh_sec)
+def account_section():
+    """账户分析（局部自动刷新：分时曲线每 refresh_sec 秒更新一次）"""
+    # 读取交易记录（当前币种以机器人状态快照为准，取不到则用 CARVUSDT）
+    status, _ = load_status()
+    SYMBOL = status.get("symbol", "CARVUSDT") if status else "CARVUSDT"
+    BASE_ASSET = SYMBOL.replace("USDT", "")
 
+    def load_data():
+        if not os.path.exists(TRADE_LOG):
+            return pd.DataFrame(), None
+        with open(TRADE_LOG, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return pd.DataFrame(data.get("trades", [])), data.get("open_position", None)
 
-def load_data():
-    if not os.path.exists(TRADE_LOG):
-        return pd.DataFrame(), None
-    with open(TRADE_LOG, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    return pd.DataFrame(data.get("trades", [])), data.get("open_position", None)
+    def load_pnl_history():
+        """读取分时盈亏记录（bot.py 每轮轮询追加一条）"""
+        if not os.path.exists(PNL_LOG):
+            return pd.DataFrame()
+        with open(PNL_LOG, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        df = pd.DataFrame(data)
+        if not df.empty:
+            df["dt"] = pd.to_datetime(df["time"])
+        return df
 
+    df, open_pos = load_data()
 
-def load_pnl_history():
-    """读取分时盈亏记录（bot.py 每轮轮询追加一条）"""
-    if not os.path.exists(PNL_LOG):
-        return pd.DataFrame()
-    with open(PNL_LOG, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    df = pd.DataFrame(data)
-    if not df.empty:
-        df["dt"] = pd.to_datetime(df["time"])
-    return df
+    if df.empty and open_pos is None:
+        st.title(f"📊 账户分析（当前交易对 {SYMBOL}）")
+        st.info("暂无交易记录。请先运行 bot.py 开始交易。")
+        return
 
+    st.title(f"📊 账户分析（当前交易对 {SYMBOL}）")
 
-df, open_pos = load_data()
+    # ============ 顶部概览卡片 ============
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
 
-if df.empty and open_pos is None:
-    st.info("暂无交易记录。请先运行 bot.py 开始交易。")
-    st.stop()
+    # 手续费：每笔 entry_fee + exit_fee，加上当前持仓开仓手续费
+    for c in ("entry_fee", "exit_fee"):
+        if c not in df.columns:
+            df[c] = 0.0
+        else:
+            df[c] = df[c].fillna(0.0)
+    df["fee"] = df["entry_fee"] + df["exit_fee"]
+    total_fee = float(df["fee"].sum())
+    if open_pos:
+        total_fee += float(open_pos.get("entry_fee", 0) or 0)
 
-st.title(f"📊 账户分析（当前交易对 {SYMBOL}）")
+    realized_pnl = df["pnl"].sum() if not df.empty else 0
+    total_trades = len(df)
+    win_trades = (df["pnl"] > 0).sum() if not df.empty else 0
+    win_rate = (win_trades / total_trades * 100) if total_trades > 0 else 0
+    net_realized = realized_pnl - total_fee
 
-# ============ 顶部概览卡片 ============
-col1, col2, col3, col4, col5, col6 = st.columns(6)
+    col1.metric("已实现盈亏", f"{realized_pnl:+.2f} USDT")
+    col2.metric("净盈亏(扣手续费)", f"{net_realized:+.2f} USDT")
+    col3.metric("累计手续费", f"{total_fee:.2f} USDT")
+    col4.metric("总交易次数", f"{total_trades} 笔")
+    col5.metric("胜率", f"{win_rate:.1f}%")
+    col6.metric("平均单笔盈亏", f"{(realized_pnl / total_trades):+.2f} USDT" if total_trades > 0 else "0.00 USDT")
 
-# 手续费：每笔 entry_fee + exit_fee，加上当前持仓开仓手续费
-for c in ("entry_fee", "exit_fee"):
-    if c not in df.columns:
-        df[c] = 0.0
+    # ============ 浮动盈亏 ============
+    if open_pos:
+        side_cn = "做多" if open_pos.get("side") == "LONG" else "做空"
+        otype_cn = ORDER_TYPE_CN.get(open_pos.get("order_type"), "—")
+        st.info(f"🟢 当前持仓中：{side_cn} {open_pos['qty']:.4f} {BASE_ASSET} @ {open_pos['price']:.4f}，名义 {open_pos['cost']:.2f} USDT（开仓方式：{otype_cn}）")
     else:
-        df[c] = df[c].fillna(0.0)
-df["fee"] = df["entry_fee"] + df["exit_fee"]
-total_fee = float(df["fee"].sum())
-if open_pos:
-    total_fee += float(open_pos.get("entry_fee", 0) or 0)
+        st.success("✅ 当前空仓，无浮动盈亏")
 
-realized_pnl = df["pnl"].sum() if not df.empty else 0
-total_trades = len(df)
-win_trades = (df["pnl"] > 0).sum() if not df.empty else 0
-win_rate = (win_trades / total_trades * 100) if total_trades > 0 else 0
-net_realized = realized_pnl - total_fee
+    # ============ 分时盈亏曲线 ============
+    st.subheader("🕐 分时盈亏曲线")
+    pnl_df = load_pnl_history()
+    if not pnl_df.empty:
+        fig_pnl = go.Figure()
+        fig_pnl.add_trace(go.Scatter(x=pnl_df["dt"], y=pnl_df["total"], name="总盈亏", line=dict(color="#26a69a")))
+        fig_pnl.add_trace(go.Scatter(x=pnl_df["dt"], y=pnl_df["realized"], name="已实现", line=dict(color="#42a5f5")))
+        # 用点标注持仓方向：绿=做多 红=做空 灰=空仓
+        pos_colors = {"LONG": "#26a69a", "SHORT": "#ef5350", "空仓": "#90a4ae"}
+        pos_series = pnl_df["position"] if "position" in pnl_df.columns else pd.Series(["空仓"] * len(pnl_df))
+        fig_pnl.add_trace(go.Scatter(
+            x=pnl_df["dt"], y=pnl_df["total"], mode="markers",
+            marker=dict(size=5, color=[pos_colors.get(p, "#90a4ae") for p in pos_series]),
+            name="持仓方向（绿=做多 红=做空）",
+        ))
+        fig_pnl.update_layout(title="账户分时盈亏 (USDT)", xaxis_title="时间", yaxis_title="盈亏 (USDT)",
+                              hovermode="x unified")
+        st.plotly_chart(fig_pnl, use_container_width=True)
+        st.caption(f"共 {len(pnl_df)} 条快照，从 {pnl_df['time'].iloc[0]} 到 {pnl_df['time'].iloc[-1]}；"
+                   f"曲线上的点颜色代表持仓方向：绿=做多 红=做空 灰=空仓")
+    else:
+        st.info("暂无分时盈亏记录，机器人每轮轮询后自动写入 pnl_history.json")
 
-col1.metric("已实现盈亏", f"{realized_pnl:+.2f} USDT")
-col2.metric("净盈亏(扣手续费)", f"{net_realized:+.2f} USDT")
-col3.metric("累计手续费", f"{total_fee:.2f} USDT")
-col4.metric("总交易次数", f"{total_trades} 笔")
-col5.metric("胜率", f"{win_rate:.1f}%")
-col6.metric("平均单笔盈亏", f"{(realized_pnl / total_trades):+.2f} USDT" if total_trades > 0 else "0.00 USDT")
+    # ============ 盈亏曲线 ============
+    st.subheader("📈 累计盈亏曲线")
+    if not df.empty:
+        df_plot = df.copy()
+        df_plot["累计盈亏"] = df_plot["pnl"].cumsum()
+        df_plot["序号"] = range(1, len(df_plot) + 1)
+        fig = px.area(df_plot, x="序号", y="累计盈亏", title="累计已实现盈亏 (USDT)")
+        fig.update_traces(line_color="#26a69a", fill="tozeroy")
+        # 标注每笔的方向：▲做多（绿）/ ▼做空（红）
+        side_colors = ["#26a69a" if s == "LONG" else "#ef5350" for s in df["side"]]
+        fig.add_trace(go.Scatter(
+            x=df_plot["序号"], y=df_plot["累计盈亏"], mode="markers+text",
+            text=["做多" if s == "LONG" else "做空" for s in df["side"]],
+            textposition="top center",
+            textfont=dict(size=11, color=side_colors),
+            marker=dict(size=10, color=side_colors,
+                        symbol=["triangle-up" if s == "LONG" else "triangle-down" for s in df["side"]]),
+            name="方向标注（▲多 ▼空）",
+        ))
+        st.plotly_chart(fig, use_container_width=True)
 
-# ============ 浮动盈亏 ============
-if open_pos:
-    side_cn = "做多" if open_pos.get("side") == "LONG" else "做空"
-    otype_cn = ORDER_TYPE_CN.get(open_pos.get("order_type"), "—")
-    st.info(f"🟢 当前持仓中：{side_cn} {open_pos['qty']:.4f} {BASE_ASSET} @ {open_pos['price']:.4f}，名义 {open_pos['cost']:.2f} USDT（开仓方式：{otype_cn}）")
+        # ============ 单笔盈亏分布 ============
+        st.subheader("💰 单笔盈亏分布")
+        fig2 = go.Figure()
+        fig2.add_trace(go.Bar(
+            x=list(range(1, len(df_plot) + 1)),
+            y=df_plot["pnl"],
+            marker_color=["#26a69a" if v >= 0 else "#ef5350" for v in df_plot["pnl"]],
+        ))
+        fig2.update_layout(title="每笔交易盈亏", xaxis_title="交易序号", yaxis_title="盈亏 (USDT)")
+        st.plotly_chart(fig2, use_container_width=True)
+
+        # ============ 统计数据 ============
+        st.subheader("📋 统计数据")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("最大盈利", f"{df['pnl'].max():+.2f} USDT")
+        c2.metric("最大亏损", f"{df['pnl'].min():+.2f} USDT")
+        c3.metric("总投入本金", f"{df['buy_cost'].sum():.2f} USDT")
+
+        # ============ 交易明细 ============
+        st.subheader("📝 交易明细")
+        display_df = df[["buy_time", "buy_price", "sell_time", "sell_price", "buy_qty", "pnl"]].copy()
+        display_df.columns = ["买入时间", "买入价", "卖出时间", "卖出价", f"数量({BASE_ASSET})", "盈亏(USDT)"]
+        display_df["开仓方式"] = df["entry_type"].map(ORDER_TYPE_CN).fillna("—") if "entry_type" in df.columns else "—"
+        display_df["平仓方式"] = df["exit_type"].map(ORDER_TYPE_CN).fillna("—") if "exit_type" in df.columns else "—"
+        display_df["手续费(USDT)"] = df["fee"].map(lambda x: f"{x:+.4f}")
+        display_df["净盈亏(USDT)"] = (df["pnl"] - df["fee"]).map(lambda x: f"{x:+.4f}")
+        display_df["盈亏(USDT)"] = display_df["盈亏(USDT)"].map(lambda x: f"{x:+.4f}")
+        display_df["平仓原因"] = df["reason"].fillna("—") if "reason" in df.columns else "—"
+        st.dataframe(display_df, use_container_width=True)
+
+        # 成交方式统计（限价/市价笔数）
+        if "entry_type" in df.columns:
+            all_types = list(df["entry_type"]) + list(df["exit_type"])
+            n_maker = all_types.count("maker")
+            n_taker = all_types.count("taker")
+            n_mixed = all_types.count("mixed")
+            st.caption(f"成交方式统计：限价(maker) {n_maker} 次 / 市价(taker) {n_taker} 次 / 混合 {n_mixed} 次"
+                       f"（每笔含开仓+平仓共 2 次下单）")
+            st.caption("手续费按成交方式估算：限价(maker) 0.02%，市价(taker) 0.05%（旧交易无手续费字段显示 0.00）")
+    else:
+        st.info("暂无已完成交易记录，等待第一笔平仓...")
+
+    st.caption(f"数据来源：{TRADE_LOG}、{PNL_LOG}、{STATUS_FILE}")
+
+
+# ---------------- 页面分发 ----------------
+
+if page == "智能操作台":
+    status_section()
+    scan_section()
 else:
-    st.success("✅ 当前空仓，无浮动盈亏")
-
-# ============ 分时盈亏曲线 ============
-st.subheader("🕐 分时盈亏曲线（每 1 秒快照）")
-pnl_df = load_pnl_history()
-if not pnl_df.empty:
-    fig_pnl = go.Figure()
-    fig_pnl.add_trace(go.Scatter(x=pnl_df["dt"], y=pnl_df["total"], name="总盈亏", line=dict(color="#26a69a")))
-    fig_pnl.add_trace(go.Scatter(x=pnl_df["dt"], y=pnl_df["realized"], name="已实现", line=dict(color="#42a5f5")))
-    # 用点标注持仓方向：绿=做多 红=做空 灰=空仓
-    pos_colors = {"LONG": "#26a69a", "SHORT": "#ef5350", "空仓": "#90a4ae"}
-    pos_series = pnl_df["position"] if "position" in pnl_df.columns else pd.Series(["空仓"] * len(pnl_df))
-    fig_pnl.add_trace(go.Scatter(
-        x=pnl_df["dt"], y=pnl_df["total"], mode="markers",
-        marker=dict(size=5, color=[pos_colors.get(p, "#90a4ae") for p in pos_series]),
-        name="持仓方向（绿=做多 红=做空）",
-    ))
-    fig_pnl.update_layout(title="账户分时盈亏 (USDT)", xaxis_title="时间", yaxis_title="盈亏 (USDT)",
-                          hovermode="x unified")
-    st.plotly_chart(fig_pnl, use_container_width=True)
-    st.caption(f"共 {len(pnl_df)} 条快照，从 {pnl_df['time'].iloc[0]} 到 {pnl_df['time'].iloc[-1]}；"
-               f"曲线上的点颜色代表持仓方向：绿=做多 红=做空 灰=空仓")
-else:
-    st.info("暂无分时盈亏记录，机器人每轮轮询后自动写入 pnl_history.json")
-
-# ============ 盈亏曲线 ============
-st.subheader("📈 累计盈亏曲线")
-if not df.empty:
-    df_plot = df.copy()
-    df_plot["累计盈亏"] = df_plot["pnl"].cumsum()
-    df_plot["序号"] = range(1, len(df_plot) + 1)
-    fig = px.area(df_plot, x="序号", y="累计盈亏", title="累计已实现盈亏 (USDT)")
-    fig.update_traces(line_color="#26a69a", fill="tozeroy")
-    # 标注每笔的方向：▲做多（绿）/ ▼做空（红）
-    side_colors = ["#26a69a" if s == "LONG" else "#ef5350" for s in df["side"]]
-    fig.add_trace(go.Scatter(
-        x=df_plot["序号"], y=df_plot["累计盈亏"], mode="markers+text",
-        text=["做多" if s == "LONG" else "做空" for s in df["side"]],
-        textposition="top center",
-        textfont=dict(size=11, color=side_colors),
-        marker=dict(size=10, color=side_colors,
-                    symbol=["triangle-up" if s == "LONG" else "triangle-down" for s in df["side"]]),
-        name="方向标注（▲多 ▼空）",
-    ))
-    st.plotly_chart(fig, use_container_width=True)
-
-    # ============ 单笔盈亏分布 ============
-    st.subheader("💰 单笔盈亏分布")
-    fig2 = go.Figure()
-    fig2.add_trace(go.Bar(
-        x=list(range(1, len(df_plot) + 1)),
-        y=df_plot["pnl"],
-        marker_color=["#26a69a" if v >= 0 else "#ef5350" for v in df_plot["pnl"]],
-    ))
-    fig2.update_layout(title="每笔交易盈亏", xaxis_title="交易序号", yaxis_title="盈亏 (USDT)")
-    st.plotly_chart(fig2, use_container_width=True)
-
-    # ============ 统计数据 ============
-    st.subheader("📋 统计数据")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("最大盈利", f"{df['pnl'].max():+.2f} USDT")
-    c2.metric("最大亏损", f"{df['pnl'].min():+.2f} USDT")
-    c3.metric("总投入本金", f"{df['buy_cost'].sum():.2f} USDT")
-
-    # ============ 交易明细 ============
-    st.subheader("📝 交易明细")
-    display_df = df[["buy_time", "buy_price", "sell_time", "sell_price", "buy_qty", "pnl"]].copy()
-    display_df.columns = ["买入时间", "买入价", "卖出时间", "卖出价", f"数量({BASE_ASSET})", "盈亏(USDT)"]
-    display_df["开仓方式"] = df["entry_type"].map(ORDER_TYPE_CN).fillna("—") if "entry_type" in df.columns else "—"
-    display_df["平仓方式"] = df["exit_type"].map(ORDER_TYPE_CN).fillna("—") if "exit_type" in df.columns else "—"
-    display_df["手续费(USDT)"] = df["fee"].map(lambda x: f"{x:+.4f}")
-    display_df["净盈亏(USDT)"] = (df["pnl"] - df["fee"]).map(lambda x: f"{x:+.4f}")
-    display_df["盈亏(USDT)"] = display_df["盈亏(USDT)"].map(lambda x: f"{x:+.4f}")
-    display_df["平仓原因"] = df["reason"].fillna("—") if "reason" in df.columns else "—"
-    st.dataframe(display_df, use_container_width=True)
-
-    # 成交方式统计（限价/市价笔数）
-    if "entry_type" in df.columns:
-        all_types = list(df["entry_type"]) + list(df["exit_type"])
-        n_maker = all_types.count("maker")
-        n_taker = all_types.count("taker")
-        n_mixed = all_types.count("mixed")
-        st.caption(f"成交方式统计：限价(maker) {n_maker} 次 / 市价(taker) {n_taker} 次 / 混合 {n_mixed} 次"
-                   f"（每笔含开仓+平仓共 2 次下单）")
-        st.caption("手续费按成交方式估算：限价(maker) 0.02%，市价(taker) 0.05%（旧交易无手续费字段显示 0.00）")
-else:
-    st.info("暂无已完成交易记录，等待第一笔平仓...")
-
-st.caption(f"数据来源：{TRADE_LOG}、{PNL_LOG}、{STATUS_FILE}")
+    account_section()
