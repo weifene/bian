@@ -41,23 +41,43 @@ if len(lines) < 2:
     sys.exit(1)
 API_KEY = lines[0]
 API_SECRET = lines[1]
-SYMBOL = "ARBUSDT"                                  # 交易对（U 本位合约）
+SYMBOL = "BEAMXUSDT"                                # 交易对（U 本位合约）
 INTERVAL = Client.KLINE_INTERVAL_15MINUTE           # 15 分钟 K 线
 FAST_PERIOD = 5                                     # 快线周期
 SLOW_PERIOD = 20                                    # 慢线周期
-BUY_USDT = 30                                       # 每次开仓名义金额（USDT）
-LEVERAGE = 3                                        # 杠杆倍数（3x）
+LEVERAGE = 10                                       # 杠杆倍数（10x：名义金额=余额×95%×10，保证金只用余额的 95%）
+POSITION_RATIO = 0.95                               # 全仓开仓比例：每次用合约钱包可用余额的 95% 作为保证金（留 5% 缓冲给手续费）
+TP_USDT = 30.0                                      # 止盈：浮动盈亏达到 +30 USDT 自动平仓锁利
+SL_USDT = 55.0                                      # 止损：浮动盈亏达到 -55 USDT 自动平仓止损
+PAUSE_FILE = r"d:\bian\manual_pause.flag"          # 手动暂停标记：检测到交易所仓位被外部改动时自动创建，恢复交易需删除此文件
+LIMIT_TIMEOUT = 4                                   # 限价单等待秒数：先挂 maker 价省手续费，超时未完全成交自动转市价兜底
+MAKER_FEE_RATE = 0.0002                             # 挂单成交（maker）手续费率
+TAKER_FEE_RATE = 0.0005                             # 吃单成交（taker）手续费率
 POLL_SECONDS = 60                                   # 每 60 秒检查一次
 BASE_ASSET = SYMBOL.replace("USDT", "")  # 基础币种（ARB）
 TRADE_LOG = os.path.join(os.path.dirname(__file__), "trade_log.json")  # 交易记录文件
 PNL_LOG = os.path.join(os.path.dirname(__file__), "pnl_history.json")   # 分时盈亏记录文件
 # ===================================================================
 
+import requests
+from requests.adapters import HTTPAdapter
+
+
+class TimeoutAdapter(HTTPAdapter):
+    """给所有请求强制加 15s 超时，防止代理断连后无限卡死"""
+    def send(self, request, **kwargs):
+        kwargs.setdefault("timeout", 15)
+        return super().send(request, **kwargs)
+
+
 class ProxiedClient(Client):
-    """确保 session 使用环境变量中的代理"""
+    """确保 session 使用环境变量中的代理，并给所有请求加 15s 超时防止卡死"""
     def _init_session(self):
         session = super()._init_session()
         session.trust_env = True  # 从环境变量读取代理
+        adapter = TimeoutAdapter()
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
         return session
 
 client = ProxiedClient(API_KEY, API_SECRET, testnet=False)
@@ -126,27 +146,141 @@ def get_wallet_balance():
     return 0.0
 
 
-def market_open(side, qty):
-    """市价开仓。side: 'LONG' 开多 / 'SHORT' 开空"""
+def calc_full_qty(price):
+    """全仓模式：用余额的 POSITION_RATIO 作为保证金，按 LEVERAGE 计算名义金额。
+    必须在本轮已平掉旧持仓之后调用，才能拿到平仓后的最新余额。"""
+    balance = get_wallet_balance()
+    notional = balance * POSITION_RATIO * LEVERAGE
+    qty = futures_round_qty(notional / price, price)
+    return qty, balance
+
+
+def market_order(qty, side):
+    """市价下单，返回 (成交数量, 平均成交价)。side: 'LONG' 买 / 'SHORT' 卖"""
     order_side = Client.SIDE_BUY if side == "LONG" else Client.SIDE_SELL
     order = client.futures_create_order(
         symbol=SYMBOL, side=order_side, type=Client.ORDER_TYPE_MARKET, quantity=qty
     )
-    return float(order["executedQty"])
+    oid = order["orderId"]
+    # 偶发：下单成功但响应缺成交字段（连接异常导致），回查订单补全
+    if not order.get("avgPrice") or not order.get("executedQty"):
+        order = client.futures_get_order(symbol=SYMBOL, orderId=oid)
+    return float(order["executedQty"]), float(order["avgPrice"]), oid
 
 
-def market_close(qty, close_side):
-    """市价平仓。close_side: 持多则 SELL，持空则 BUY"""
-    order_side = Client.SIDE_SELL if close_side == "LONG" else Client.SIDE_BUY
-    client.futures_create_order(
-        symbol=SYMBOL, side=order_side, type=Client.ORDER_TYPE_MARKET, quantity=qty
+def get_book_top(side):
+    """取盘口挂单价：开多/平空挂买一，开空/平多挂卖一，被动等成交（maker 手续费）"""
+    book = client.futures_order_book(symbol=SYMBOL, limit=5)
+    if side == "LONG":
+        return float(book["bids"][0][0])
+    else:
+        return float(book["asks"][0][0])
+
+
+def wait_fill_or_fallback(order, total_qty, side):
+    """混合下单核心：轮询等待限价单成交；超时未完全成交则取消，用市价补足差额。
+    返回 (实际成交数量, 加权平均价, 成交类型, 手续费估算)：
+      maker=限价全成交 / taker=全靠市价 / mixed=限价部分+市价补足"""
+    oid = order["orderId"]
+    filled, cost = 0.0, 0.0
+    limit_filled, limit_avg = 0.0, 0.0
+    for _ in range(int(LIMIT_TIMEOUT)):
+        st = client.futures_get_order(symbol=SYMBOL, orderId=oid)
+        status = st["status"]
+        if status == "FILLED":
+            limit_filled = float(st.get("executedQty", 0) or 0)
+            limit_avg = float(st.get("avgPrice", 0) or 0)
+            filled, cost = limit_filled, limit_filled * limit_avg
+            break
+        if status in ("CANCELED", "EXPIRED"):
+            break
+        time.sleep(1)
+    else:
+        # 超时未成交：取消限价单，避免后续与信号冲突
+        try:
+            client.futures_cancel_order(symbol=SYMBOL, orderId=oid)
+        except Exception:
+            pass
+        st = client.futures_get_order(symbol=SYMBOL, orderId=oid)
+        limit_filled = float(st.get("executedQty", 0) or 0)
+        limit_avg = float(st.get("avgPrice", 0) or 0)
+        filled, cost = limit_filled, limit_filled * limit_avg
+    # 差额用市价补足
+    remain = total_qty - filled
+    market_filled, market_cost = 0.0, 0.0
+    if remain > 0:
+        q2, p2, _ = market_order(remain, side)
+        market_filled, market_cost = q2, p2 * q2
+        filled += q2
+        cost += market_cost
+    avg = cost / filled if filled else 0.0
+    # 手续费估算：限价部分按 maker 费率，市价补足部分按 taker 费率
+    fee = limit_filled * limit_avg * MAKER_FEE_RATE + market_cost * TAKER_FEE_RATE
+    if limit_filled <= 0:
+        otype = "taker"
+    elif remain > 0:
+        otype = "mixed"
+    else:
+        otype = "maker"
+    return filled, avg, otype, fee
+
+
+def smart_open(side, qty):
+    """混合开仓：先挂限价（maker 手续费），超时未成交转市价。返回 (成交数量, 均价, 成交类型)"""
+    px = get_book_top(side)
+    qty = futures_round_qty(qty, px)
+    order_side = Client.SIDE_BUY if side == "LONG" else Client.SIDE_SELL
+    order = client.futures_create_order(
+        symbol=SYMBOL, side=order_side, type=Client.ORDER_TYPE_LIMIT,
+        quantity=qty, price=px, timeInForce=Client.TIME_IN_FORCE_GTC,
     )
+    return wait_fill_or_fallback(order, qty, side)
+
+
+def smart_close(qty, position_side):
+    """混合平仓：先挂限价（maker 手续费），超时未成交转市价。
+    position_side: 被平仓位方向（持多平多传 'LONG'，持空平空传 'SHORT'）。
+    返回 (成交数量, 均价, 成交类型)"""
+    close_side = "SHORT" if position_side == "LONG" else "LONG"  # 平多卖、平空买
+    px = get_book_top(close_side)
+    qty = futures_round_qty(qty, px)
+    order_side = Client.SIDE_SELL if close_side == "SHORT" else Client.SIDE_BUY
+    order = client.futures_create_order(
+        symbol=SYMBOL, side=order_side, type=Client.ORDER_TYPE_LIMIT,
+        quantity=qty, price=px, timeInForce=Client.TIME_IN_FORCE_GTC,
+    )
+    return wait_fill_or_fallback(order, qty, close_side)
 
 
 def get_futures_price():
     """取合约最新价（用合约 K 线，与策略数据同源）"""
     klines = client.futures_klines(symbol=SYMBOL, interval=INTERVAL, limit=1)
     return float(klines[0][4])
+
+
+def check_tp_sl(amt, entry, price):
+    """止盈止损检查：按当前浮动盈亏判断是否触发。
+    返回 'TP'（止盈）/ 'SL'（止损）/ None（未触发）"""
+    if not amt or not entry:
+        return None
+    side = 1 if amt > 0 else -1
+    floating = (price - entry) * abs(amt) * side
+    if floating >= TP_USDT:
+        return "TP"
+    if floating <= -SL_USDT:
+        return "SL"
+    return None
+
+
+def is_paused():
+    """是否处于手动暂停状态（检测到交易所仓位被外部改动后自动暂停）"""
+    return os.path.exists(PAUSE_FILE)
+
+
+def pause_bot(reason):
+    """写入暂停标记文件，机器人停止自动交易直到用户恢复"""
+    with open(PAUSE_FILE, "w", encoding="utf-8") as f:
+        f.write(f"{reason} @ {datetime.datetime.now()}\n")
 
 
 # ---------------- 策略逻辑 ----------------
@@ -230,9 +364,12 @@ def main():
     trades, open_position = load_trades()
     set_leverage()
     ensure_one_way_mode()
-    print(f"机器人启动 | {SYMBOL} 双向做多做空 | 杠杆 {LEVERAGE}x | 每次开仓 {BUY_USDT} USDT 名义")
+    print(f"机器人启动 | {SYMBOL} 双向做多做空 | 杠杆 {LEVERAGE}x | 全仓模式（保证金用余额的 {POSITION_RATIO*100:.0f}%）| 止盈/止损 {TP_USDT:.0f}/{SL_USDT:.0f}U | 下单：限价优先（maker），超时 {LIMIT_TIMEOUT}s 转市价")
     print(f"合约钱包 USDT 余额: {get_wallet_balance():.2f}")
     print(f"当前持仓: {'记录有持仓' if open_position else '记录空仓'} | 历史已平仓 {len(trades)} 笔")
+    if is_paused():
+        print(f"[警告] 存在暂停标记（{os.path.basename(PAUSE_FILE)}），机器人启动后保持暂停状态，删除该文件后恢复自动交易")
+    risk_exit_side = None  # 止盈/止损离场方向：同方向不立即重进，等信号翻向对面再开仓
     while True:
         try:
             fast, slow, last = check_signal()
@@ -247,62 +384,126 @@ def main():
 
             amt, entry = get_position()  # 实际交易所持仓
             rec_pos = open_position       # 本地记录持仓
-            qty_to_trade = futures_round_qty(BUY_USDT / last, last)  # 开仓数量
 
-            if qty_to_trade <= 0:
-                print(f"[{now}] [警告] 计算开仓数量为 0（5 USDT 可能低于最小下单量），跳过本轮")
+            # 手动暂停保护：检测交易所仓位被外部改动（手动平仓/手动开仓/手动翻向），自动暂停不自动交易
+            if is_paused():
+                print(f"[{now}] [暂停中] 检测到手动操作已暂停交易，等待恢复（删除 {os.path.basename(PAUSE_FILE)} 后恢复自动交易）", flush=True)
                 time.sleep(POLL_SECONDS)
                 continue
+            manual = None
+            if open_position and amt == 0:
+                manual = "手动平仓"
+            elif open_position and ((open_position["side"] == "LONG" and amt < 0) or (open_position["side"] == "SHORT" and amt > 0)):
+                manual = "手动反向开仓"
+            elif not open_position and amt != 0:
+                manual = "手动开仓"
+            if manual:
+                print(f"[{now}] [警告] 检测到{manual}（本地记录 {'多' if open_position and open_position['side'] == 'LONG' else '空'}，实际仓位 {amt}），自动暂停交易保护，不会动你的仓位", flush=True)
+                open_position = None
+                save_trades(trades, open_position)
+                pause_bot(manual)
+                time.sleep(POLL_SECONDS)
+                continue
+
+            # 止盈/止损检查：触发则平仓锁利/止损，并标记离场方向（同方向暂不重进）
+            hit = check_tp_sl(amt, entry, last)
+            if hit:
+                pos_side = "LONG" if amt > 0 else "SHORT"
+                fq, fp, ot, fee = smart_close(abs(amt), pos_side)
+                pnl = (fp - entry) * fq * (1 if pos_side == "LONG" else -1)
+                trades.append({
+                    "buy_time": rec_pos["time"] if rec_pos else now,
+                    "buy_price": rec_pos["price"] if rec_pos else 0,
+                    "buy_qty": abs(amt),
+                    "buy_cost": rec_pos["cost"] if rec_pos else fq * fp,
+                    "sell_time": now,
+                    "sell_price": fp,
+                    "sell_qty": fq,
+                    "sell_revenue": fq * fp,
+                    "pnl": pnl,
+                    "side": pos_side,
+                    "entry_type": rec_pos.get("order_type", "—") if rec_pos else "—",
+                    "exit_type": ot,
+                    "entry_fee": rec_pos.get("entry_fee", 0) if rec_pos else 0,
+                    "exit_fee": fee,
+                    "reason": "止盈" if hit == "TP" else "止损",
+                })
+                print(f"[{now}] >>> {('止盈' if hit == 'TP' else '止损')} {fq} {BASE_ASSET} @ {fp:.4f}（{ot}），盈亏 {pnl:+.2f} USDT（手续费 {fee:.4f}U）", flush=True)
+                open_position = None
+                save_trades(trades, open_position)
+                risk_exit_side = pos_side
+                amt = 0
 
             # 信号=多：应持多
             if signal == "多":
                 if amt < 0:  # 当前持空 -> 平空
-                    market_close(abs(amt), "SHORT")
-                    pnl = (last - entry) * abs(amt) * -1 if entry else 0.0
+                    fill_qty, fill_px, otype, exit_fee = smart_close(abs(amt), "SHORT")
+                    pnl = (fill_px - entry) * fill_qty * -1 if entry else 0.0
                     trades.append({
                         "buy_time": rec_pos["time"] if rec_pos else now,
                         "buy_price": rec_pos["price"] if rec_pos else 0,
                         "buy_qty": abs(amt),
-                        "buy_cost": 0,
+                        "buy_cost": fill_qty * fill_px,
                         "sell_time": now,
-                        "sell_price": last,
-                        "sell_qty": abs(amt),
-                        "sell_revenue": 0,
+                        "sell_price": fill_px,
+                        "sell_qty": fill_qty,
+                        "sell_revenue": rec_pos["cost"] if rec_pos else fill_qty * fill_px,
                         "pnl": pnl,
                         "side": "SHORT",
+                        "entry_type": rec_pos.get("order_type", "—") if rec_pos else "—",
+                        "exit_type": otype,
+                        "entry_fee": rec_pos.get("entry_fee", 0) if rec_pos else 0,
+                        "exit_fee": exit_fee,
                     })
-                    print(f"[{now}] >>> 平空 @ {last:.4f}，盈亏 {pnl:+.2f} USDT", flush=True)
+                    print(f"[{now}] >>> 平空 @ {fill_px:.4f}（{otype}），盈亏 {pnl:+.2f} USDT（手续费 {exit_fee:.4f}U）", flush=True)
                     open_position = None
-                if amt <= 0:  # 空仓或刚平空 -> 开多
-                    market_open("LONG", qty_to_trade)
-                    open_position = {"time": now, "side": "LONG", "qty": qty_to_trade, "price": last, "cost": qty_to_trade * last}
                     save_trades(trades, open_position)
-                    print(f"[{now}] >>> 金叉开多 {qty_to_trade} {BASE_ASSET} @ {last:.4f}，名义 {qty_to_trade*last:.2f} USDT", flush=True)
+                if amt <= 0 and risk_exit_side != "LONG":  # 空仓或刚平空 -> 开多（止盈/止损离场后同方向不立即重进）
+                    qty_to_trade, balance = calc_full_qty(last)
+                    if qty_to_trade <= 0 or qty_to_trade * last / LEVERAGE > balance:
+                        print(f"[{now}] [警告] 余额不足无法开多（可用 {balance:.2f} USDT），跳过本轮")
+                        time.sleep(POLL_SECONDS)
+                        continue
+                    fill_qty, fill_px, otype, entry_fee = smart_open("LONG", qty_to_trade)
+                    risk_exit_side = None
+                    open_position = {"time": now, "side": "LONG", "qty": fill_qty, "price": fill_px, "cost": fill_qty * fill_px, "order_type": otype, "entry_fee": entry_fee}
+                    save_trades(trades, open_position)
+                    print(f"[{now}] >>> 金叉开多 {fill_qty} {BASE_ASSET} @ {fill_px:.4f}，名义 {fill_qty*fill_px:.2f} USDT（全仓·{otype}）", flush=True)
             # 信号=空：应持空
             else:
                 if amt > 0:  # 当前持多 -> 平多
-                    market_close(amt, "LONG")
-                    pnl = (last - entry) * amt if entry else 0.0
+                    fill_qty, fill_px, otype, exit_fee = smart_close(amt, "LONG")
+                    pnl = (fill_px - entry) * fill_qty if entry else 0.0
                     trades.append({
                         "buy_time": rec_pos["time"] if rec_pos else now,
                         "buy_price": rec_pos["price"] if rec_pos else 0,
                         "buy_qty": amt,
                         "buy_cost": rec_pos["cost"] if rec_pos else 0,
                         "sell_time": now,
-                        "sell_price": last,
-                        "sell_qty": amt,
-                        "sell_revenue": amt * last,
+                        "sell_price": fill_px,
+                        "sell_qty": fill_qty,
+                        "sell_revenue": fill_qty * fill_px,
                         "pnl": pnl,
                         "side": "LONG",
+                        "entry_type": rec_pos.get("order_type", "—") if rec_pos else "—",
+                        "exit_type": otype,
+                        "entry_fee": rec_pos.get("entry_fee", 0) if rec_pos else 0,
+                        "exit_fee": exit_fee,
                     })
-                    print(f"[{now}] >>> 平多 @ {last:.4f}，盈亏 {pnl:+.2f} USDT", flush=True)
+                    print(f"[{now}] >>> 平多 @ {fill_px:.4f}（{otype}），盈亏 {pnl:+.2f} USDT（手续费 {exit_fee:.4f}U）", flush=True)
                     open_position = None
                     save_trades(trades, open_position)
-                if amt >= 0:  # 空仓或刚平多 -> 开空
-                    market_open("SHORT", qty_to_trade)
-                    open_position = {"time": now, "side": "SHORT", "qty": qty_to_trade, "price": last, "cost": qty_to_trade * last}
+                if amt >= 0 and risk_exit_side != "SHORT":  # 空仓或刚平多 -> 开空（止盈/止损离场后同方向不立即重进）
+                    qty_to_trade, balance = calc_full_qty(last)
+                    if qty_to_trade <= 0 or qty_to_trade * last / LEVERAGE > balance:
+                        print(f"[{now}] [警告] 余额不足无法开空（可用 {balance:.2f} USDT），跳过本轮")
+                        time.sleep(POLL_SECONDS)
+                        continue
+                    fill_qty, fill_px, otype, entry_fee = smart_open("SHORT", qty_to_trade)
+                    risk_exit_side = None
+                    open_position = {"time": now, "side": "SHORT", "qty": fill_qty, "price": fill_px, "cost": fill_qty * fill_px, "order_type": otype, "entry_fee": entry_fee}
                     save_trades(trades, open_position)
-                    print(f"[{now}] >>> 死叉开空 {qty_to_trade} {BASE_ASSET} @ {last:.4f}，名义 {qty_to_trade*last:.2f} USDT", flush=True)
+                    print(f"[{now}] >>> 死叉开空 {fill_qty} {BASE_ASSET} @ {fill_px:.4f}，名义 {fill_qty*fill_px:.2f} USDT（全仓·{otype}）", flush=True)
         except Exception as e:
             print(f"[{now}] 出错: {e}")
         time.sleep(POLL_SECONDS)

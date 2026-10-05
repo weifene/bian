@@ -8,3 +8,4 @@ venv/
 # 运行时数据文件（机器人每 60 秒追加，不进版本库）
 trade_log.json
 pnl_history.json
+manual_pause.flag
