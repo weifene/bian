@@ -417,6 +417,7 @@ def manage_positions(now, positions, trades):
             maxe = max(pos.get("maxe") or cl[-1], hi[-1])
             pos["maxe"] = maxe
             pos["atr"] = a
+            pos["last_px"] = cl[-1]     # 最新价（当前15m K线收盘≈最新成交价），供看板计算真实浮动盈亏
             trail = maxe - K * a
             pos["trail"] = trail
             pos["trail_pct"] = (hi[-1] - trail) / trail * 100 if trail > 0 else 999.0

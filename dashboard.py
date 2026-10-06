@@ -405,21 +405,67 @@ def status_section():
         st.caption(f"最新心跳：{status.get('time', '—')}｜当前信号 **{status.get('signal', '—')}**｜"
                    f"策略：吊灯 K5×ATR(15m,14)·仅做多·确认2根·R²0.85")
         if positions:
-            try:
-                pdl = pd.DataFrame([
-                    {"币种": s, "方向": "做多", "数量": f"{p.get('qty', 0):.4f}",
-                     "开仓价": f"{p.get('price', 0):.6f}",
-                     "持仓最高价": f"{p.get('maxe', 0):.6f}",
-                     "吊灯线(跌破即卖)": f"{p.get('trail', 0):.6f}",
-                     "名义U": f"{p.get('notional', 0):.2f}",
-                     "吊灯距离": (f"{p.get('trail_pct', 0):.1f}%" if p.get('trail_pct') is not None else "—")}
-                    for s, p in positions.items()
-                ])
-                st.markdown(f"**📦 当前持仓（{n_pos}）**")
-                st.dataframe(pdl, use_container_width=True, height=32 * (n_pos + 1))
-                st.caption("看懂这栏：**吊灯保护线距离 = 当前价比上方‘止损线’高出百分之几**，数字越接近 0，离被自动止损越近。")
-            except Exception:
-                pass
+            # 逐仓计算真实浮动盈亏，按从亏到赚排序
+            items = []
+            for s, p in positions.items():
+                qty = p.get("qty", 0) or 0
+                price = p.get("price", 0) or 0
+                last = p.get("last_px")
+                notional = p.get("notional", 0) or 0
+                if last:
+                    pnl = (last - price) * qty                        # 浮动盈亏 U
+                    chg = (last - price) / price * 100 if price else 0.0
+                    margin_u = notional / lev if lev else 0.0         # 该仓保证金=名义/杠杆
+                    mret = pnl / margin_u * 100 if margin_u else 0.0  # 占保证金收益率（含杠杆）
+                else:
+                    pnl = chg = mret = None
+                items.append({"sym": s, "qty": qty, "price": price, "last": last,
+                              "notional": notional, "pnl": pnl, "chg": chg, "mret": mret,
+                              "tp": p.get("trail_pct"), "trail": p.get("trail"),
+                              "maxe": p.get("maxe")})
+            items.sort(key=lambda r: (r["pnl"] is None, r["pnl"] if r["pnl"] is not None else 0.0))
+            st.markdown(f"**📦 当前持仓（{n_pos}）·最亏的排在最前**")
+            for r in items:
+                with st.container(border=True):
+                    c1, c2, c3, c4, c5 = st.columns([1.2, 1.5, 1.4, 1.0, 1.5])
+                    _pnl = r["pnl"]
+                    dot = "🔴" if (_pnl is not None and _pnl < 0) else ("🟢" if (_pnl is not None and _pnl > 0) else "⚪")
+                    c1.markdown(f"**{dot} {r['sym']}**　做多")
+                    c1.caption(f"{r['qty']:g} 个｜名义 {r['notional']:.1f}U")
+                    if _pnl is None:
+                        c2.caption("最新价取价中…")
+                        c3.caption("—")
+                    else:
+                        if _pnl < 0:
+                            hexc, arrow = "#d93025", "▼"
+                        elif _pnl > 0:
+                            hexc, arrow = "#188038", "▲"
+                        else:
+                            hexc, arrow = "#5f6368", "■"
+                        # 内联 HTML 着色：跨主题/版本都能稳定红绿
+                        c2.markdown(
+                            f"<div style='font-size:12px;color:#80868b;margin-bottom:2px'>浮动盈亏</div>"
+                            f"<div style='font-size:24px;font-weight:700;color:{hexc};line-height:1.2'>"
+                            f"{arrow} {_pnl:+.3f} U</div>"
+                            f"<div style='font-size:12px;color:{hexc};margin-top:2px'>"
+                            f"保证金收益率 <b>{r['mret']:+.1f}%</b>（含 {lev}x 杠杆）</div>",
+                            unsafe_allow_html=True,
+                        )
+                        c3.metric("最新价（对开仓）", f"{r['last']:.5f}",
+                                  delta=f"{r['chg']:+.2f}%")
+                    if r["tp"] is not None:
+                        c4.metric("距吊灯线", f"{r['tp']:.1f}%")
+                        c4.caption("跌破即市价卖")
+                    c5.markdown(
+                        f"开仓价 `{r['price']:.5f}`\n\n"
+                        f"持仓最高 `{r['maxe']:.5f}`\n\n"
+                        f"吊灯线 `{r['trail']:.5f}`" if r.get("trail") is not None else
+                        f"开仓价 `{r['price']:.5f}`\n\n持仓最高 `{r['maxe']:.5f}`"
+                    )
+            st.caption(
+                "🔴红=亏 🟢绿=赚。**浮动盈亏=(最新价−开仓价)×数量**；**保证金收益率=这笔浮盈占该仓保证金（已含 3 倍杠杆放大）**，"
+                "这才是你每一笔真实的输赢；它和“距吊灯线%”（离被自动卖出还有多远）是两回事——吊灯距离很远也可能已经在亏。"
+            )
         if positions and any(p.get("trail_pct") is not None for p in positions.values()):
             # 按距吊灯线由近到远排序（最危险的排最前）
             items = [(s, p.get("trail_pct")) for s, p in positions.items() if p.get("trail_pct") is not None]
