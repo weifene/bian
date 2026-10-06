@@ -1,0 +1,137 @@
+{
+  "params": {
+    "r2": 0.85,
+    "sl": 0.0001,
+    "k": 5.0,
+    "conf": 2
+  },
+  "summary": {
+    "ret": 10.71,
+    "ann": 51.1,
+    "dd": 19.5,
+    "trades": 312,
+    "win": 37.8
+  },
+  "percoin": {
+    "BTCUSDT": {
+      "pnl": 0.034,
+      "trades": 16
+    },
+    "ETHUSDT": {
+      "pnl": 0.01,
+      "trades": 16
+    },
+    "ZECUSDT": {
+      "pnl": 0.507,
+      "trades": 10
+    },
+    "SOLUSDT": {
+      "pnl": 1.053,
+      "trades": 13
+    },
+    "RLCUSDT": {
+      "pnl": 1.017,
+      "trades": 11
+    },
+    "XRPUSDT": {
+      "pnl": 0.704,
+      "trades": 14
+    },
+    "NEARUSDT": {
+      "pnl": 1.685,
+      "trades": 8
+    },
+    "HYPEUSDT": {
+      "pnl": 0.069,
+      "trades": 14
+    },
+    "SUIUSDT": {
+      "pnl": 0.969,
+      "trades": 10
+    },
+    "DOGEUSDT": {
+      "pnl": -0.479,
+      "trades": 5
+    },
+    "ADAUSDT": {
+      "pnl": 0.089,
+      "trades": 7
+    },
+    "ENAUSDT": {
+      "pnl": -0.135,
+      "trades": 3
+    },
+    "GTCUSDT": {
+      "pnl": 0.006,
+      "trades": 6
+    },
+    "BNBUSDT": {
+      "pnl": -0.087,
+      "trades": 13
+    },
+    "QNTUSDT": {
+      "pnl": 2.815,
+      "trades": 10
+    },
+    "PUMPUSDT": {
+      "pnl": 0.997,
+      "trades": 13
+    },
+    "FILUSDT": {
+      "pnl": 1.617,
+      "trades": 12
+    },
+    "UNIUSDT": {
+      "pnl": -0.387,
+      "trades": 11
+    },
+    "MOVRUSDT": {
+      "pnl": 0.563,
+      "trades": 7
+    },
+    "WLDUSDT": {
+      "pnl": 0.193,
+      "trades": 8
+    },
+    "1000PEPEUSDT": {
+      "pnl": 1.218,
+      "trades": 7
+    },
+    "AAVEUSDT": {
+      "pnl": 1.433,
+      "trades": 15
+    },
+    "SANDUSDT": {
+      "pnl": 0.091,
+      "trades": 5
+    },
+    "AVAXUSDT": {
+      "pnl": 0.963,
+      "trades": 6
+    },
+    "TAOUSDT": {
+      "pnl": -0.931,
+      "trades": 11
+    },
+    "NILUSDT": {
+      "pnl": 1.75,
+      "trades": 11
+    },
+    "LINKUSDT": {
+      "pnl": 1.493,
+      "trades": 12
+    },
+    "BTWUSDT": {
+      "pnl": -1.429,
+      "trades": 17
+    },
+    "AINUSDT": {
+      "pnl": -2.425,
+      "trades": 10
+    },
+    "BRUSDT": {
+      "pnl": 0.246,
+      "trades": 11
+    }
+  }
+}

@@ -17,5 +17,3 @@ open_request.json
 stop_request.flag
 scan_queue_snapshot.json
 top20_pool.json
-vol_pool.json
-backtest_*_result.json

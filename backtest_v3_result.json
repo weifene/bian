@@ -1,0 +1,170 @@
+{
+  "days": 30,
+  "universe": 30,
+  "r2": 0.7,
+  "slope": 0.00015,
+  "results": [
+    {
+      "K": 3,
+      "conf": 1,
+      "long_only": true,
+      "ret%": -13.00062673267709,
+      "trades": 760,
+      "win%": 37.89473684210527,
+      "max_pos": 25,
+      "open": 7
+    },
+    {
+      "K": 3,
+      "conf": 1,
+      "long_only": false,
+      "ret%": -40.44476450851134,
+      "trades": 1437,
+      "win%": 33.95963813500348,
+      "max_pos": 27,
+      "open": 10
+    },
+    {
+      "K": 3,
+      "conf": 4,
+      "long_only": true,
+      "ret%": -3.082431180001535,
+      "trades": 728,
+      "win%": 36.95054945054945,
+      "max_pos": 25,
+      "open": 2
+    },
+    {
+      "K": 3,
+      "conf": 4,
+      "long_only": false,
+      "ret%": -28.769063380319,
+      "trades": 1368,
+      "win%": 33.845029239766085,
+      "max_pos": 27,
+      "open": 5
+    },
+    {
+      "K": 4,
+      "conf": 1,
+      "long_only": true,
+      "ret%": 1.4337523302316697,
+      "trades": 478,
+      "win%": 38.28451882845189,
+      "max_pos": 26,
+      "open": 7
+    },
+    {
+      "K": 4,
+      "conf": 1,
+      "long_only": false,
+      "ret%": -16.952272900374524,
+      "trades": 909,
+      "win%": 34.87348734873487,
+      "max_pos": 28,
+      "open": 9
+    },
+    {
+      "K": 4,
+      "conf": 4,
+      "long_only": true,
+      "ret%": 12.482170879307048,
+      "trades": 459,
+      "win%": 39.21568627450981,
+      "max_pos": 26,
+      "open": 2
+    },
+    {
+      "K": 4,
+      "conf": 4,
+      "long_only": false,
+      "ret%": -5.636746335214752,
+      "trades": 869,
+      "win%": 35.558112773302646,
+      "max_pos": 28,
+      "open": 5
+    },
+    {
+      "K": 6,
+      "conf": 1,
+      "long_only": true,
+      "ret%": 22.23250889480373,
+      "trades": 282,
+      "win%": 41.48936170212766,
+      "max_pos": 28,
+      "open": 7
+    },
+    {
+      "K": 6,
+      "conf": 1,
+      "long_only": false,
+      "ret%": 1.5975708544904705,
+      "trades": 501,
+      "win%": 37.12574850299401,
+      "max_pos": 30,
+      "open": 11
+    },
+    {
+      "K": 6,
+      "conf": 4,
+      "long_only": true,
+      "ret%": 35.13482678824397,
+      "trades": 279,
+      "win%": 42.29390681003584,
+      "max_pos": 28,
+      "open": 2
+    },
+    {
+      "K": 6,
+      "conf": 4,
+      "long_only": false,
+      "ret%": 13.874416277432275,
+      "trades": 492,
+      "win%": 38.00813008130081,
+      "max_pos": 30,
+      "open": 7
+    }
+  ],
+  "best": {
+    "K": 6,
+    "conf": 4,
+    "long_only": true,
+    "ret%": 35.13482678824397,
+    "trades": 279,
+    "win%": 42.29390681003584,
+    "max_pos": 28,
+    "open": 2
+  },
+  "segments": [
+    {
+      "K": 6,
+      "conf": 4,
+      "long_only": true,
+      "ret%": -1.3139250586955171,
+      "trades": 32,
+      "win%": 25.0,
+      "max_pos": 11,
+      "open": 1
+    },
+    {
+      "K": 6,
+      "conf": 4,
+      "long_only": true,
+      "ret%": 1.902899622590553,
+      "trades": 148,
+      "win%": 45.94594594594595,
+      "max_pos": 28,
+      "open": 12
+    },
+    {
+      "K": 6,
+      "conf": 4,
+      "long_only": true,
+      "ret%": -0.6646010846524746,
+      "trades": 87,
+      "win%": 37.93103448275862,
+      "max_pos": 17,
+      "open": 2
+    }
+  ]
+}
