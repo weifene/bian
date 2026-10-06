@@ -1,4 +1,4 @@
-﻿"""
+"""
 币安 U 本位合约 趋势跟随量化交易机器人（实盘，仅做多）
 ======================================================
 策略来源：回测隔离配置（backtest_v4.py 的 ISOLATE 分支 + v3 信号已验证）。
@@ -50,8 +50,8 @@ INTERVAL = Client.KLINE_INTERVAL_15MINUTE          # 通用取价/ATR 用 15m K 
 
 # ---- 交易参数（对齐回测隔离配置：100U 账户基准） ----
 LEVERAGE = 3                                        # 杠杆倍数
-POS_MARGIN_USDT = 10.0                               # 每仓保证金 10U，×3倍杠杆 = 名义 30U（实盘手动调大；回测基准为 2U/6U）
-MAX_POS = 8                                         # 同时最大持仓数（8仓×30U=240U名义，对100U账户总敞口约2.4倍）
+POS_MARGIN_PCT = 0.10                               # 每仓保证金占「账户总资金(权益)」比例：10%×3x=名义30%权益（动态随余额缩放，最多8仓）
+MAX_POS = 8                                         # 同时最大持仓数（8仓×10%保证金=占用80%权益，留20%缓冲；总名义约2.4倍）
 VOL_POOL_N = 30                                     # 选币池：成交量前 N 的 USDT 永续
 VOL_POOL_FILE = r"d:\bian\vol_pool.json"            # 选币池缓存（每 4 小时整点刷新）
 
@@ -194,6 +194,29 @@ def get_wallet_balance():
     return 0.0
 
 
+def get_account_equity():
+    """返回账户总资金（权益）= 钱包余额 + 全仓未实现盈亏。
+    动态仓位以它为基数：余额上涨自动加仓、亏损自动缩仓。查询失败回退钱包余额。"""
+    try:
+        for b in client.futures_account_balance():
+            if b["asset"] == "USDT":
+                return float(b["balance"]) + float(b.get("crossUnPnl", 0) or 0)
+    except Exception:
+        pass
+    return get_wallet_balance()
+
+
+def get_available_balance():
+    """返回当前可用于开新仓的可用保证金（availableBalance，已扣除持仓占用）"""
+    try:
+        for b in client.futures_account_balance():
+            if b["asset"] == "USDT":
+                return float(b.get("availableBalance", b["balance"]))
+    except Exception:
+        pass
+    return 0.0
+
+
 def market_order(qty, side, symbol=None):
     """市价下单，返回 (成交数量, 平均成交价, 订单id)。side: 'LONG' 买 / 'SHORT' 卖"""
     sym = symbol or SYMBOL
@@ -207,9 +230,12 @@ def market_order(qty, side, symbol=None):
     return float(order["executedQty"]), float(order["avgPrice"]), oid
 
 
-def order_market_position(symbol, side, margin_usdt=POS_MARGIN_USDT):
-    """按固定保证金（默认 2U）× 杠杆，对指定 symbol **市价**开仓。
+def order_market_position(symbol, side, margin_usdt=None):
+    """按保证金 × 杠杆对指定 symbol **市价**开仓。
+    margin_usdt 不传时动态取「账户总资金 × POS_MARGIN_PCT」。
     返回 (成交数量, 成交均价, 名义金额, 手续费估算)。"""
+    if margin_usdt is None:
+        margin_usdt = get_account_equity() * POS_MARGIN_PCT
     notional = margin_usdt * LEVERAGE
     px = get_futures_price_for(symbol)
     qty = futures_round_qty(notional / px, px, symbol)
@@ -329,12 +355,14 @@ def try_open_entries(now, positions, trades, pool, confirm):
             held.add(sym)
     if len(held) >= MAX_POS:
         return
+    # 本轮动态保证金 = 账户总资金 × 比例（同一轮各仓一致，避免循环中权益波动导致仓位忽大忽小）
+    margin_usdt = get_account_equity() * POS_MARGIN_PCT
     for sym in pool:
         if sym in held:
             continue
-        bal = get_wallet_balance()
-        if bal < POS_MARGIN_USDT * 1.1:
-            print(f"[{now}] 余额 {bal:.2f}U 不足开新仓（需 ≥{POS_MARGIN_USDT*1.1:.1f}U），停止开仓", flush=True)
+        avail = get_available_balance()
+        if avail < margin_usdt * 1.1:
+            print(f"[{now}] 可用余额 {avail:.2f}U 不足开新仓（本仓需保证金 ≈{margin_usdt:.1f}U），停止开仓", flush=True)
             return
         active, slope = trend_status(sym)
         if not active:                 # 趋势强度不达标：确认计数清零（对齐回测 sig）
@@ -351,7 +379,7 @@ def try_open_entries(now, positions, trades, pool, confirm):
             continue
         try:
             set_leverage(sym)
-            fill_qty, fill_px, notional, fee = order_market_position(sym, "LONG")
+            fill_qty, fill_px, notional, fee = order_market_position(sym, "LONG", margin_usdt)
             if fill_qty <= 0:
                 confirm[sym] = 0
                 continue
@@ -530,9 +558,24 @@ def _pid_alive(pid):
         return True  # 检测失败时保守视为占用，宁可少开也不并发两个
 
 
+_SINGLETON_PID = None
+
+
+def _release_singleton():
+    """仅当锁文件里是自己的 PID 时才删除，避免误删后来者的锁。"""
+    try:
+        if _SINGLETON_PID is not None and os.path.exists(LOCK_FILE):
+            with open(LOCK_FILE, "r", encoding="utf-8") as f:
+                if f.read().strip() == str(_SINGLETON_PID):
+                    os.remove(LOCK_FILE)
+    except Exception:
+        pass
+
+
 def acquire_singleton():
     """单实例锁：锁文件里记录的旧 PID 仍存活时，本实例直接退出，杜绝两个 bot 并发重复下单。
-    正常退出经 atexit 删锁；崩溃残留的锁由 PID 存活检测兜底（旧 PID 已不在则自动接管）。"""
+    正常退出经 atexit + 停止分支显式调用双重释放；崩溃残留的锁由 PID 存活检测兜底。"""
+    global _SINGLETON_PID
     import atexit
     if os.path.exists(LOCK_FILE):
         try:
@@ -544,25 +587,19 @@ def acquire_singleton():
             print(f"检测到已有 bot.py 实例运行中（PID {old}），本实例自动退出以避免并发重复下单。"
                   f"如需重启，请先在看板点“停止程序”或结束旧进程。", flush=True)
             sys.exit(0)
+    _SINGLETON_PID = os.getpid()
     with open(LOCK_FILE, "w", encoding="utf-8") as f:
-        f.write(str(os.getpid()))
-
-    def _release():
-        try:
-            if os.path.exists(LOCK_FILE):
-                with open(LOCK_FILE, "r", encoding="utf-8") as f:
-                    if f.read().strip() == str(os.getpid()):
-                        os.remove(LOCK_FILE)
-        except Exception:
-            pass
-    atexit.register(_release)
+        f.write(str(_SINGLETON_PID))
+    atexit.register(_release_singleton)
 
 
 def main():
     acquire_singleton()   # 单实例保护：已有 bot 在跑则直接退出，防止并发重复下单
     trades, positions, _saved = load_trades()
-    print(f"机器人启动 | v4 趋势跟随·仅多 | 成交量前{VOL_POOL_N}·吊灯K{K}×ATR·确认{CONF}根 | 每仓 {POS_MARGIN_USDT:.0f}U×{LEVERAGE}x=(名义{POS_MARGIN_USDT*LEVERAGE:.0f}U) | 最多{MAX_POS}仓 | 每{ENTRY_INTERVAL//60}分钟评估开仓 | reason=吊灯止损")
-    print(f"合约钱包 USDT 余额: {get_wallet_balance():.2f} | 历史已平仓 {len(trades)} 笔 | 当前持仓 {len(positions)} 个")
+    _equity0 = get_account_equity()
+    _m0 = _equity0 * POS_MARGIN_PCT
+    print(f"机器人启动 | v4 趋势跟随·仅多 | 成交量前{VOL_POOL_N}·吊灯K{K}×ATR·确认{CONF}根 | 每仓=总资金{POS_MARGIN_PCT*100:.0f}%×{LEVERAGE}x（当前权益{_equity0:.1f}U→保证金{_m0:.1f}U/名义{_m0*LEVERAGE:.1f}U）| 最多{MAX_POS}仓 | 每{ENTRY_INTERVAL//60}分钟评估开仓 | reason=吊灯止损")
+    print(f"合约账户权益 USDT: {_equity0:.2f}（钱包 {get_wallet_balance():.2f} / 可用 {get_available_balance():.2f}）| 历史已平仓 {len(trades)} 笔 | 当前持仓 {len(positions)} 个")
     ensure_one_way_mode()
     confirm = {}            # 内存：各币趋势连续确认根数
     pool = []
@@ -578,6 +615,7 @@ def main():
                     os.remove(STOP_FILE)
                 except Exception:
                     pass
+                _release_singleton()
                 sys.exit(0)
 
             # 一、持仓吊灯跟踪止损

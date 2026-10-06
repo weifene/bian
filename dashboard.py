@@ -58,7 +58,7 @@ _BOT_PARAM_CACHE = {"mtime": 0, "params": {}}
 def read_bot_params():
     """直接解析 bot.py 文本中的策略常量（不 import，避免触发交易所客户端初始化）。
     返回 dict：R2_ENTRY / SL_H / H_WIN / CONF / K / ATR_N / LEVERAGE /
-              POS_MARGIN_USDT / MAX_POS / VOL_POOL_N / ENTRY_INTERVAL / POLL_SECONDS / FUNDING_RATE_LIMIT。
+              POS_MARGIN_USDT / POS_MARGIN_PCT / MAX_POS / VOL_POOL_N / ENTRY_INTERVAL / POLL_SECONDS / FUNDING_RATE_LIMIT。
     文件未变则走缓存。"""
     try:
         mtime = os.path.getmtime(BOT_PY)
@@ -67,8 +67,8 @@ def read_bot_params():
     if mtime == _BOT_PARAM_CACHE["mtime"] and _BOT_PARAM_CACHE["params"]:
         return _BOT_PARAM_CACHE["params"]
     want = {"R2_ENTRY", "SL_H", "H_WIN", "CONF", "K", "ATR_N", "LEVERAGE",
-            "POS_MARGIN_USDT", "MAX_POS", "VOL_POOL_N", "ENTRY_INTERVAL",
-            "POLL_SECONDS", "FUNDING_RATE_LIMIT"}
+            "POS_MARGIN_USDT", "POS_MARGIN_PCT", "MAX_POS", "VOL_POOL_N",
+            "ENTRY_INTERVAL", "POLL_SECONDS", "FUNDING_RATE_LIMIT"}
     out = {}
     try:
         with open(BOT_PY, "r", encoding="utf-8-sig") as f:
@@ -288,7 +288,13 @@ def status_section():
     kk = bp.get("K", 5.0)
     atrn = bp.get("ATR_N", 14)
     lev = int(bp.get("LEVERAGE", 3))
-    margin = bp.get("POS_MARGIN_USDT", 2.0)
+    margin_pct = bp.get("POS_MARGIN_PCT")          # 新版：占总资金比例（动态）
+    margin_fixed = bp.get("POS_MARGIN_USDT")       # 旧版兼容：固定 U 数
+    live_bal = float((status or {}).get("balance", 0) or 0)
+    if margin_pct is not None:
+        margin_now = live_bal * margin_pct
+    else:
+        margin_now = margin_fixed or 2.0
     maxpos = int(bp.get("MAX_POS", 8))
     pooln = int(bp.get("VOL_POOL_N", 30))
     entry_min = int(bp.get("ENTRY_INTERVAL", 900)) // 60
@@ -329,8 +335,17 @@ def status_section():
             "**④** 因为只做多，它在**整体向上 / 有结构性行情**的币上最容易赚钱；遇到**熊市或长期横盘**，信号会变少、或被吊灯线反复小亏止损——这是本策略最主要的风险。"
         )
 
+        if margin_pct is not None:
+            margin_desc = (
+                f"每仓保证金 = **账户总资金（含浮动盈亏的权益）的 {margin_pct*100:.0f}% × {lev} 倍杠杆**，"
+                f"即名义约为权益的 **{margin_pct*lev*100:.0f}%**；仓位**随账户动态缩放**——赚钱自动加大、亏钱自动缩小。"
+                f"按当前余额约 {live_bal:.1f}U 估算，每仓保证金≈**{margin_now:.1f}U**、名义≈**{margin_now*lev:.1f}U**；同时最多持 **{maxpos}** 仓"
+                f"（8 仓满仓约占用 80% 保证金、总敞口约 2.4 倍）"
+            )
+        else:
+            margin_desc = f"每仓保证金 **{margin_now:g} U × {lev} 倍杠杆 = 名义 {margin_now*lev:g} U**，同时最多持 **{maxpos}** 仓"
         rule_rows2 = [
-            ("💰 每仓大小", f"每仓保证金 **{margin:g} U × {lev} 倍杠杆 = 名义 {margin*lev:g} U**，同时最多持 **{maxpos}** 仓"),
+            ("💰 每仓大小", margin_desc),
             ("🛑 卖出(止损/止盈)", f"**吊灯线 = 持仓以来最高价 − {kk:g} × ATR({atrn},15分钟)**；价格跌破立即**市价卖出**。涨得越多线抬得越高＝自动锁定利润"),
             ("⏱️ 运行节奏", f"每 **{entry_min} 分钟**评估一次开新仓；持仓时每 **{poll_s} 秒**检查一次吊灯线"),
             ("🧾 下单方式", "开仓、平仓**全部用市价单**（吃单 taker，手续费约 0.05%/边），保证触发即成交、不挂单等待"),
