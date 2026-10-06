@@ -134,6 +134,73 @@ def detect_bot_processes():
         return -1, []
 
 
+# ---------------- 小白友好的"程序在做什么"文案 ----------------
+
+def plain_program_status(status, alive, sp, holding):
+    """根据机器人状态 + 扫描进度，产出大白话说人话的『当前在做什么』。
+    返回 (emoji, 主文案)。"""
+    if not alive:
+        return ("🛑",
+                "程序当前**未运行**。点击下方的『🚀 启动机器人』后，它才会开始扫描币种、自动买卖。")
+    if holding:
+        n = len(status.get("positions") or {})
+        return ("📉",
+                f"正在**盯守 {n} 个持仓**的“吊灯保护线”。程序每 **5 秒**用最新价核对一次："
+                f"价格越涨，保护线抬得越高（= 锁定浮盈）；一旦跌穿保护线，就**自动卖出止损**，不让亏损失控。")
+    # 空仓：看扫描进度
+    if sp:
+        phase = sp.get("phase")
+        if phase == "scanning":
+            return ("🔎",
+                    f"当前**空仓**，正在扫描选币池 {sp.get('current', 0)}/{sp.get('total', 0)} 只币，"
+                    f"寻找“正在上涨、连续 4 根确认趋势”的下一个目标，找到就会自动买入。")
+        if phase == "done":
+            mm, ss = divmod(max(0, int(sp.get('next_ts', 0) - time.time())), 60)
+            return ("⏳",
+                    f"当前**空仓**。上一轮从约 30 只选币池里找到 **{sp.get('found', 0)}** 只上涨趋势币；"
+                    f"距离下一轮扫描还有 **{mm:02d}:{ss:02d}**。找到仍在上涨的币就会自动买入。")
+        if phase == "error":
+            return ("⚠️", "上一轮扫描因接口异常失败，程序会稍后自动重试，无需你处理。")
+    return ("🛰️", "正在等待机器人开始扫描…（启动后约 1 分钟会进入状态）")
+
+
+CONSOLE_LOG = os.path.join(BASE_DIR, "bot_console.log")
+# 只展示这些“动作”日志，忽略每 5 秒一次的普通心跳
+ACTION_KEYWORDS = ("自动开多", "吊灯", "选币池", "资金费率", "机器人", "已无仓位",
+                   "移除本地", "开仓失败", "切为", "开平", "已开")
+
+
+def load_recent_actions(n=6):
+    """读取 bot_console.log 末尾，提取最近 n 条『程序动作』（开仓/止损/刷池/启动等），
+    新→旧返回 [(时间, 内容), ...]。"""
+    if not os.path.exists(CONSOLE_LOG):
+        return []
+    try:
+        with open(CONSOLE_LOG, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+    except Exception:
+        return []
+    out = []
+    for ln in reversed(lines[-300:]):
+        content = ln.rstrip()
+        if not content.strip():
+            continue
+        # 跳过每 5 秒一次的心跳行（"持仓 N | 已实现 … | 总盈亏 …"），它不算“动作”
+        if "已实现" in content and "总盈亏" in content and " | " in content:
+            continue
+        if not any(k in content for k in ACTION_KEYWORDS):
+            continue
+        if content.startswith("[") and "] " in content:
+            ts, _, text = content[1:].partition("] ")
+        else:
+            ts, text = "—", content
+        if text:
+            out.append((ts.strip(), text.strip()))
+        if len(out) >= n:
+            break
+    return out
+
+
 # ---------------- 页面选择 ----------------
 
 page = st.sidebar.radio("页面", ["智能操作台", "账户分析"])
@@ -151,46 +218,64 @@ STATUS_REFRESH_SEC = 1
 def status_section():
     """机器人状态卡片 + 程序控制（局部自动刷新）"""
     st.title("🤖 智能操作台")
-    st.caption("v4 趋势跟随·仅做多：成交量前 30 永续池，1h 回归 R²≥0.70 且 |斜率|≥0.00015，15m 连续确认 4 根后自动市价开多"
-               "（每仓 2U×3x=6U 名义，最多 8 仓）；吊灯止损 K=6×ATR(15m,14) 自动平仓（reason=吊灯止损）。")
+
+    # ---- 小白一句话讲清机器人怎么赚钱 ----
+    with st.expander("👶 一分钟看懂：它是怎么帮我在币圈赚钱的？（小白必看）", expanded=True):
+        st.markdown(
+            "这台程序帮你做**趋势跟随**，好比“**只坐上升的电梯，电梯一掉头就立刻下**”：\n\n"
+            "- **买什么**：只从**成交量最高的 30 只币**里挑，而且只买**正在上涨、连续 4 根确认上升趋势**的币，自动**市价买入**。\n"
+            "- **怎么赚**：买进后让它跟着趋势“**跑**”，涨得越高**越不急着卖**，让利润放大。\n"
+            "- **什么时候卖**：头顶挂一条“**吊灯保护线**”——价格越高、线抬得越高（等于**锁定浮盈**）；一旦价格掉头跌穿这条线，就**自动卖出止损**，不让亏损扩大。\n"
+            "- **仓位多大**：每只只投 **2U 保证金 × 3 倍杠杆**（约 6U），最多同时持 **8 只**，分散风险。\n"
+            "- **你要做什么**：几乎全是**全自动**——程序自己盯盘、自己买、自己止损。你只需偶尔回来看一眼本页。\n\n"
+            "⚠️ **风险提醒**：这是**真实资金 + 杠杆**自动交易，行情极端可能**强平**。请务必先用小金额验证。"
+        )
 
     status, alive = load_status()
+    sp = load_scan_progress()
+    holding = status.get("position", "") not in ("", "空仓")
+
+    # ---- 当前在做什么（大白话）：放最显眼位置 ----
+    emoji, plain_txt = plain_program_status(status, alive, sp, holding)
+    st.markdown("### 🧭 程序现在正在做什么")
+    st.info(f"{emoji}　{plain_txt}")
 
     # ---------- 机器人状态 ----------
-    st.subheader("📡 机器人状态")
+    st.subheader("📡 机器人状态（数字速览）")
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("运行状态", "🟢 运行中" if alive else "🔴 已停止")
     positions = status.get("positions") or {}
     n_pos = len(positions)
     c2.metric("持仓数", f"{n_pos}" if alive else "—")
     c3.metric("持仓方向", (status.get("position") or "空仓").replace("\n", " | ") if alive else "—")
-    c4.metric("信号", status.get("signal", "—") if alive else "—")
-    c5.metric("余额 (USDT)", f"{status.get('balance', 0):.2f}" if alive else "—")
-    c6.metric("总盈亏 (USDT)", f"{status.get('total', 0):+.2f}" if alive else "—")
+    c4.metric("余额 (USDT)", f"{status.get('balance', 0):.2f}" if alive else "—")
+    c5.metric("总盈亏 (USDT)", f"{status.get('total', 0):+.2f}" if alive else "—")
+    c6.metric("已实现盈亏", f"{status.get('realized', 0):+.2f}" if alive else "—")
+    st.caption("提示：总盈亏 = 已实现（已卖出落袋的钱）+ 浮动（还没卖、跟着行情浮动的钱）。")
     if alive:
-        st.caption(f"最新心跳：{status.get('time', '—')} | 已实现 {status.get('realized', 0):+.2f} / 浮动 {status.get('floating', 0):+.2f} | "
-                   f"策略：吊灯 K6×ATR(15m,14)·仅多·确认4根")
+        st.caption(f"最新心跳：{status.get('time', '—')}｜当前信号 **{status.get('signal', '—')}**｜"
+                   f"策略：吊灯 K6×ATR(15m,14)·仅做多·确认4根")
         if positions:
             try:
                 pdl = pd.DataFrame([
                     {"币种": s, "方向": "做多", "数量": f"{p.get('qty', 0):.4f}",
                      "开仓价": f"{p.get('price', 0):.6f}", "名义U": f"{p.get('notional', 0):.2f}",
-                     "吊灯距离": (f"{p.get('trail_pct', 0):.0f}%" if p.get('trail_pct') is not None else "—"),
+                     "吊灯保护线距离": (f"{p.get('trail_pct', 0):.0f}%" if p.get('trail_pct') is not None else "—"),
                      "最新价": f"{p.get('last_px', 0):.6f}"}
                     for s, p in positions.items()
                 ])
                 st.markdown(f"**📦 当前持仓（{n_pos}）**")
                 st.dataframe(pdl, use_container_width=True, height=32 * (n_pos + 1))
+                st.caption("看懂这栏：**吊灯保护线距离 = 当前价比上方‘止损线’高出百分之几**，数字越接近 0，离被自动止损越近。")
             except Exception:
                 pass
         if positions and any(p.get("trail_pct") is not None for p in positions.values()):
-            # 逐仓吊灯止损距离（对应到各持仓）
             trail_lines = []
             for s, p in positions.items():
                 tp = p.get("trail_pct")
                 trail_lines.append(f"`{s}` 距吊灯线 **{tp:.0f}%**" if tp is not None else f"`{s}` —")
-            st.markdown(f"**📉 吊灯止损距离**（逐仓）：{ '　'.join(trail_lines) }")
-            st.caption("吊灯线 = 持仓最高价 maxe − 6×ATR(15m,14)；价格距吊灯线越近越易触发，跌破即市价平仓（reason=吊灯止损）。")
+            st.markdown(f"**📉 吊灯保护线距离**（逐仓）：{ '　'.join(trail_lines) }")
+            st.caption("吊灯线 = 持仓最高价 − 6×ATR；价格涨、线跟涨（锁浮盈），价格跌破线就自动市价止损。")
         if status.get("open_note"):
             note_txt = status.get("open_note", "")
             if "已开" in note_txt:
@@ -198,16 +283,14 @@ def status_section():
             else:
                 st.warning(f"⚠️ 开仓未执行：{note_txt}（{status.get('open_note_time', '')}）"
                            f"　—— 确认后立即开单，拦截仅因方向 / 资金费率 / 余额不足")
-        st.success("机器人运行正常，持仓自动管理 + 空仓自动扫描中。")
+        st.success("✅ 机器人运行正常：持仓自动盯守，空仓自动扫描。")
         # ---------- 扫描执行进度（实时倒计时/进度条）----------
-        sp = load_scan_progress()
-        holding = status.get("position", "") not in ("", "空仓")
         if sp:
             phase = sp.get("phase")
             if phase == "scanning":
                 cur, tot, found = sp.get("current", 0), sp.get("total", 0), sp.get("found", 0)
                 pct = (cur / tot) if tot else 0
-                st.markdown(f"**🔄 全市场扫描中**：`{cur}/{tot}`，已发现 **{found}** 个干净趋势目标")
+                st.markdown(f"**🔄 正在扫描清洗趋势目标**：`{cur}/{tot}`，已发现 **{found}** 只")
                 st.progress(pct)
             elif phase == "done":
                 next_ts = sp.get("next_ts", 0)
@@ -223,8 +306,19 @@ def status_section():
                 st.error("⚠️ 扫描失败（接口异常），下轮重试。")
         else:
             st.caption("扫描进度暂无数据（机器人未启动或尚未开始扫描）。")
+        # ---------- 最近动态（机器人刚刚做了什么）----------
+        acts = load_recent_actions()
+        if acts:
+            st.markdown("**🗒️ 最近动态（机器人刚刚做了什么）**")
+            for ts, text in acts:
+                st.markdown(f"- `{ts}`　{text}")
     else:
-        st.info("看板未检测到机器人心跳。若机器人已停止，可点击下方“启动机器人”；启动后约 10 秒内显示状态。")
+        st.info("看板未检测到机器人心跳。若机器人已停止，可点击下方『🚀 启动机器人』；启动后约 10 秒内显示状态。")
+        acts = load_recent_actions(n=8)
+        if acts:
+            st.markdown("**🗒️ 机器人停止前的最近动态**")
+            for ts, text in acts:
+                st.markdown(f"- `{ts}`　{text}")
 
     # ---------- 程序控制 ----------
     st.subheader("🛑 程序控制")
@@ -273,9 +367,14 @@ def scan_controls():
     """扫描区（主流程，交互控件不进 fragment，避免自动刷新卡顿/回弹）：
     选币池与信号由 scan_table_fragment 局部自动刷新。"""
     st.subheader("🔍 选币池 / 趋势信号")
-    st.caption("每 4 小时（0/4/8/12/16/20 点）按 24h 成交量更新选币池（前 30 只 USDT 永续）；"
-               "每 15 分钟对新 15m bar 评估：1h 线性回归 R²≥0.70 且 |斜率|≥0.00015 且为上升趋势，"
-               "连续 4 根确认后自动市价开多。")
+    with st.expander("👶 这里在看什么？", expanded=False):
+        st.markdown(
+            "下面这排币 = 机器人**用来挑猎物的“鱼池”**（成交量最高的 30 只，每 4 小时由程序自动更新一次）。\n\n"
+            "- 带 🟢 **已开** = 已经买入、正在持有的币（它们也继续留在池里盯守）。\n"
+            "- 机器人每 **15 分钟**挨个“体检”这些币：谁能稳定**向上走（上升趋势）且连续 4 根确认**，就直接**市价买入**。\n"
+            "- 不用你手动选——程序看到机会就自己动手。你只要看它对不对、效果好不好。"
+        )
+    st.caption("逻辑：成交量最高 30 只 → 1h 上升趋势 R²≥0.70 且 |斜率|≥0.00015 → 15m 连续确认 4 根 → 自动市价开多。")
 
     # ---------- 选币池表格（纯展示，fragment 自动刷新，不影响上方交互控件）----------
     scan_table_fragment()
