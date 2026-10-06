@@ -2,12 +2,12 @@
 币安 U 本位合约量化交易 - 可视化看板
 
 页面：
-  - 智能操作台：机器人状态 / 全市场"干净趋势"扫描 Top10 展示 / 选择币种开仓（全仓，机器人复核后执行） / 停止与启动机器人 / 恢复自动交易
+  - 智能操作台：机器人状态 / 全市场"干净趋势"扫描 Top10 展示 / 选择币种开仓（全仓，确认后立即执行） / 停止与启动机器人 / 恢复自动交易
   - 账户分析：盈亏概览 / 分时盈亏曲线 / 交易明细 / 手续费统计
 
 与 bot.py 通过文件通信：
   - 读：bot_status.json（状态快照）、scan_results.json（扫描 Top N）、trade_log.json / pnl_history.json
-  - 写：open_request.json（开仓请求）、stop_request.flag（停止）、删除 manual_pause.flag（恢复交易）
+  - 写：open_request.json（开仓请求）、stop_request.flag（停止）
 
 性能：使用 st.fragment(run_every=...) 局部自动刷新（仅数据区定时重绘），
 不再用 JS 整页刷新，交互不卡顿、所选币种不会被刷新重置。
@@ -18,6 +18,7 @@ import os
 import json
 import time
 import sys
+import base64
 import subprocess
 import streamlit as st
 import pandas as pd
@@ -34,11 +35,11 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TRADE_LOG = os.path.join(BASE_DIR, "trade_log.json")
 PNL_LOG = os.path.join(BASE_DIR, "pnl_history.json")
 SCAN_RESULTS_FILE = os.path.join(BASE_DIR, "scan_results.json")
+SCAN_PROGRESS_FILE = os.path.join(BASE_DIR, "scan_progress.json")
 OPEN_REQUEST_FILE = os.path.join(BASE_DIR, "open_request.json")
 STOP_FILE = os.path.join(BASE_DIR, "stop_request.flag")
 STATUS_FILE = os.path.join(BASE_DIR, "bot_status.json")
 SCAN_WINDOW_FILE = os.path.join(BASE_DIR, "scan_window.json")
-PAUSE_FILE = os.path.join(BASE_DIR, "manual_pause.flag")
 BOT_PY = os.path.join(BASE_DIR, "bot.py")
 
 # 成交类型中文化（bot.py 写入的 maker/taker/mixed）
@@ -63,6 +64,15 @@ def load_status():
         return None, False
 
 
+def load_window():
+    """读取当前趋势窗口小时数（scan_window.json，默认 3 小时）"""
+    try:
+        with open(SCAN_WINDOW_FILE, "r", encoding="utf-8") as f:
+            return json.load(f).get("hours", 3)
+    except Exception:
+        return 3
+
+
 def load_scan():
     """读取机器人扫描结果（Top N 干净趋势目标）"""
     if not os.path.exists(SCAN_RESULTS_FILE):
@@ -74,11 +84,22 @@ def load_scan():
         return None
 
 
-def write_open_request(sym):
-    """向机器人发送开仓请求（机器人复核趋势后全仓开单）"""
+def load_scan_progress():
+    """读取扫描进度快照（机器人扫描时实时写入）"""
+    if not os.path.exists(SCAN_PROGRESS_FILE):
+        return None
+    try:
+        with open(SCAN_PROGRESS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def write_open_request(sym, side, price, score):
+    """向机器人发送开仓请求（含方向/价格/评分，机器人确认后立即全仓开单，不再复核趋势门槛）"""
     with open(OPEN_REQUEST_FILE, "w", encoding="utf-8") as f:
-        json.dump({"symbol": sym, "time": time.strftime("%Y-%m-%d %H:%M:%S")}, f,
-                  ensure_ascii=False, indent=2)
+        json.dump({"symbol": sym, "side": side, "price": price, "score": score,
+                   "time": time.strftime("%Y-%m-%d %H:%M:%S")}, f, ensure_ascii=False, indent=2)
 
 
 def start_bot():
@@ -87,6 +108,29 @@ def start_bot():
     log = open(os.path.join(BASE_DIR, "bot_console.log"), "a", encoding="utf-8")
     subprocess.Popen([sys.executable, BOT_PY], cwd=BASE_DIR, creationflags=flags,
                      stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, close_fds=True)
+
+
+def detect_bot_processes():
+    """检测当前正在运行的 bot.py 进程。返回 (进程数, [(PID, 启动时间), ...])；
+    进程数 = -1 表示检测失败（不拦截启动）。"""
+    try:
+        script = ("$p = Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
+                  "Where-Object { $_.CommandLine -match 'bot\\.py' }; if ($p) { "
+                  "$p | ForEach-Object { \"$($_.ProcessId)|$($_.CreationDate)\" } }")
+        # 用 UTF-16LE base64 编码避免 Windows 命令行引号转义问题
+        enc = base64.b64encode(script.encode("utf-16-le")).decode()
+        out = subprocess.run(["powershell", "-NoProfile", "-EncodedCommand", enc],
+                             capture_output=True, text=True, timeout=15).stdout
+        procs = []
+        for ln in out.splitlines():
+            ln = ln.strip()
+            if "|" in ln:
+                pid, _, ts = ln.partition("|")
+                if pid.strip().isdigit():
+                    procs.append((pid.strip(), ts.strip()))
+        return len(procs), procs
+    except Exception:
+        return -1, []
 
 
 # ---------------- 页面选择 ----------------
@@ -98,47 +142,86 @@ st.sidebar.caption("页面不再整页刷新：仅数据区域按此间隔局部
 
 # ================= 智能操作台 =================
 
-@st.fragment(run_every=refresh_sec)
+# 状态区（含评分回撤进度）：bot.py 每 1 秒写 bot_status.json，这里按最高频每秒局部刷新
+STATUS_REFRESH_SEC = 1
+
+
+@st.fragment(run_every=STATUS_REFRESH_SEC)
 def status_section():
     """机器人状态卡片 + 程序控制（局部自动刷新）"""
     st.title("🤖 智能操作台")
-    st.caption("机器人空仓时每 2 分钟扫描全市场“干净趋势”目标写入本页；开仓需你确认后由机器人复核并全仓下单，"
-               "清仓（趋势破坏 / 止损）始终自动执行。")
+    st.caption("机器人自动多品种组合持仓：不停扫描，评分>800 且候选队列较上次变化≥10% 时自动市价补仓（每仓 6U 保证金 × 3x），"
+               "最多同时持有 5 个品种，不同品种不重复下单，余额不足自动停止；卖出 = 评分较持仓峰值下降 25%（市价平仓，始终自动执行）。")
 
     status, alive = load_status()
-    paused = bool(status and status.get("paused"))
 
     # ---------- 机器人状态 ----------
     st.subheader("📡 机器人状态")
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("运行状态", "🟢 运行中" if alive else "🔴 已停止")
-    c2.metric("当前币种", status.get("symbol", "—") if alive else "—")
-    c3.metric("持仓方向", status.get("position", "—") if alive else "—")
+    positions = status.get("positions") or {}
+    n_pos = len(positions)
+    c2.metric("持仓数", f"{n_pos}/5" if alive else "—")
+    c3.metric("持仓方向", (status.get("position") or "空仓").replace("\n", " | ") if alive else "—")
     c4.metric("信号", status.get("signal", "—") if alive else "—")
     c5.metric("余额 (USDT)", f"{status.get('balance', 0):.2f}" if alive else "—")
     c6.metric("总盈亏 (USDT)", f"{status.get('total', 0):+.2f}" if alive else "—")
     if alive:
-        st.caption(f"最新心跳：{status.get('time', '—')} | 现价 {status.get('price', 0):.4f} | "
+        st.caption(f"最新心跳：{status.get('time', '—')} | "
                    f"已实现 {status.get('realized', 0):+.2f} / 浮动 {status.get('floating', 0):+.2f} | "
-                   f"上次扫描：{status.get('last_scan', '—')}（{status.get('candidate_count', 0)} 个候选）")
+                   f"上次扫描：{status.get('last_scan', '—')}（{status.get('candidate_count', 0)} 个候选）\uFF5E"
+                   f"自动开仓：评分>800 且队列变化≥10%")
+        if positions:
+            try:
+                pdl = pd.DataFrame([
+                    {"币种": s, "方向": p.get("side"), "数量": f"{p.get('qty', 0):.4f}",
+                     "开仓价": f"{p.get('price', 0):.6f}", "入仓保证金U": f"{p.get('entry_fee', '-'):.1f}" if False else "6.0"}
+                    for s, p in positions.items()
+                ])
+                st.markdown(f"**📦 当前持仓（{n_pos}/5）**")
+                st.dataframe(pdl, use_container_width=True, height=32 * (n_pos + 1))
+            except Exception:
+                pass
         if status.get("break_score") is not None:
             brk = int(status.get("break_score", 0))
             holding = status.get("position", "") != "空仓"
-            st.markdown(f"**📉 趋势破坏进度**：`{brk} 分`"
-                        f"（{'持仓中，距触发趋势破坏平仓还有 **' + str(100 - brk) + ' 分**' if holding else '当前空仓，反映本币趋势健康度'}）")
+            st.markdown(f"**📉 评分回撤进度**：`{brk} 分`"
+                        f"（{'持仓中，距评分回撤平仓还有 **' + str(100 - brk) + ' 分**' if holding else '当前空仓，反映本币趋势健康度'}）")
             st.progress(min(100, max(0, brk)) / 100)
-            st.caption("0 分 = 刚进场（趋势最干净）→ 100 分 = 趋势破坏（R² 跌破离场阈值或斜率走平，触发自动平仓）")
+            st.caption("0 分 = 评分在峰值（趋势最干净）→ 100 分 = 评分较峰值下降 25%"
+                       "（评分 = R²×1000 + |斜率|×100000，回测最优阈值，触发自动平仓）")
         if status.get("open_note"):
             note_txt = status.get("open_note", "")
             if "已开" in note_txt:
                 st.success(f"✅ {note_txt}（{status.get('open_note_time', '')}）")
             else:
                 st.warning(f"⚠️ 开仓未执行：{note_txt}（{status.get('open_note_time', '')}）"
-                           f"　—— 界面表格是扫描时的趋势，机器人下单前会实时复核，趋势已变则不进场")
-        if paused:
-            st.warning(f"⚠️ 暂停中：{status.get('paused', '')}。机器人当前只扫描、不交易，恢复请点下方按钮。")
+                           f"　—— 确认后立即开单，拦截仅因方向 / 资金费率 / 余额不足")
+        st.success("机器人运行正常，持仓自动管理 + 空仓自动扫描中。")
+        # ---------- 扫描执行进度（实时倒计时/进度条）----------
+        sp = load_scan_progress()
+        holding = status.get("position", "") not in ("", "空仓")
+        if sp:
+            phase = sp.get("phase")
+            if phase == "scanning":
+                cur, tot, found = sp.get("current", 0), sp.get("total", 0), sp.get("found", 0)
+                pct = (cur / tot) if tot else 0
+                st.markdown(f"**🔄 全市场扫描中**：`{cur}/{tot}`，已发现 **{found}** 个干净趋势目标")
+                st.progress(pct)
+            elif phase == "done":
+                next_ts = sp.get("next_ts", 0)
+                remain = max(0, int(next_ts - time.time()))
+                mm, ss = divmod(remain, 60)
+                found = sp.get("found", 0)
+                stn = sp.get("time", "—")
+                if holding:
+                    st.caption(f"✅ 上次扫描 {stn}，找到 {found} 个候选；当前持仓中不进行新扫描。")
+                else:
+                    st.caption(f"✅ 上次扫描 {stn}，找到 {found} 个候选；距离下次扫描 **{mm:02d}:{ss:02d}**。")
+            elif phase == "error":
+                st.error("⚠️ 扫描失败（接口异常），下轮重试。")
         else:
-            st.success("机器人运行正常，持仓自动管理 + 空仓自动扫描中。")
+            st.caption("扫描进度暂无数据（机器人未启动或尚未开始扫描）。")
     else:
         st.info("看板未检测到机器人心跳。若机器人已停止，可点击下方“启动机器人”；启动后约 10 秒内显示状态。")
 
@@ -146,15 +229,7 @@ def status_section():
     st.subheader("🛑 程序控制")
     cc1, cc2, cc3 = st.columns(3)
     with cc1:
-        if paused and alive:
-            if st.button("▶️ 恢复自动交易", use_container_width=True):
-                if os.path.exists(PAUSE_FILE):
-                    os.remove(PAUSE_FILE)
-                    st.success("已删除暂停标记，机器人下一轮（≤1 秒）恢复自动交易")
-                else:
-                    st.info("暂停标记已不存在")
-        else:
-            st.info("当前未暂停（暂停由检测到手动操作触发）")
+        st.info("机器人检测到仓位被外部改动时不再自动暂停，始终自动交易")
     with cc2:
         if alive:
             if st.button("⏹ 停止程序", type="primary", use_container_width=True):
@@ -163,76 +238,74 @@ def status_section():
                 st.success("已发送停止指令，机器人将在下一轮（≤1 秒）优雅退出。")
         else:
             if st.button("🚀 启动机器人", use_container_width=True):
-                start_bot()
-                st.success("已启动机器人，等待首轮心跳（约 1 分钟）。")
+                cnt, procs = detect_bot_processes()
+                if cnt == 1:
+                    st.warning(f"检测到机器人已在运行（PID {procs[0][0]}，启动于 {procs[0][1]}），无需再次启动。")
+                elif cnt > 1:
+                    pids = "、".join(p[0] for p in procs)
+                    st.error(f"检测到 **{cnt} 个并发 bot.py 进程**（PID {pids}）！为避免重复开单/平仓，请先清理多余进程"
+                             f"再点击启动（可在任务管理器结束多余进程，或告诉我帮你清理）。")
+                else:
+                    start_bot()
+                    st.success("已启动机器人，等待首轮心跳（约 1 分钟）。")
     with cc3:
         st.caption("停止/启动不影响已持仓：机器人重启后会按交易记录继续管理持仓。")
 
 
-@st.fragment(run_every=max(15, refresh_sec // 2))
-def scan_section():
-    """扫描结果 + 趋势窗口 + 选择开仓（局部自动刷新，所选币种不会被重置）"""
-    st.subheader("🔍 全市场扫描结果（干净趋势 Top 10）")
-
-    # ---------- 趋势窗口选择（写入 scan_window.json，机器人每轮读取并生效）----------
-    def load_window():
-        if not os.path.exists(SCAN_WINDOW_FILE):
-            return 12
-        try:
-            with open(SCAN_WINDOW_FILE, "r", encoding="utf-8") as f:
-                return json.load(f).get("hours", 12)
-        except Exception:
-            return 12
-
-    scan = load_scan()
-    cur_window = (scan or {}).get("hours") or load_window()
-    opts = [1, 3, 6, 12]
-    w1, w2 = st.columns([1, 4])
-    with w1:
-        wh = st.selectbox("趋势窗口（小时）", opts, index=opts.index(cur_window) if cur_window in opts else 3, key="win_sel")
-        if wh != cur_window:
-            with open(SCAN_WINDOW_FILE, "w", encoding="utf-8") as f:
-                json.dump({"hours": wh}, f)
-            st.success(f"已切换为最近 {wh} 小时，机器人下一轮（≤1 秒）生效")
-    with w2:
-        st.caption(f"当前趋势窗口：最近 **{cur_window} 小时**（扫描选币 / 开仓复核 / 持仓信号统一使用，"
-                   f"按窗口自动选周期保证约 60 根 K 线：1h→1m×60、3h→3m×60、6h→5m×72、12h→15m×48）。"
-                   f"窗口越短趋势越灵敏（1 小时适合短线），越长越稳（12 小时过滤噪声）。")
-    if scan and scan.get("candidates"):
-        cands = scan["candidates"]
-        df_scan = pd.DataFrame(cands)
-        df_scan["方向"] = df_scan["direction"].map({1: "做多（上升）", -1: "做空（下降）"})
-        df_scan["R²"] = df_scan["r2"].round(3)
-        df_scan["斜率%/根"] = (df_scan["slope_pct"] * 100).map(lambda x: f"{x:+.4f}")
-        df_scan["现价"] = df_scan["price"].map(lambda x: f"{x:.6f}")
-        df_scan["24h量(M U)"] = (df_scan["vol"] / 1e6).map(lambda x: f"{x:.1f}")
-        df_scan["评分"] = df_scan["score"].round(1)
-        show = df_scan[["rank", "symbol", "方向", "R²", "斜率%/根", "现价", "24h量(M U)", "评分"]]
-        show.columns = ["#", "币种", "方向", "R²", "斜率%/根", "现价", "24h量(M U)", "评分"]
-        st.dataframe(show.set_index("#"), use_container_width=True)
-        st.caption(f"扫描时间：{scan.get('time', '—')} | R² 越接近 1 说明 K 线越贴近直线（趋势越干净），"
-                   f"斜率正=向上、负=向下。每 2 分钟更新一次。")
-
-        # ---------- 选择开仓 ----------
-        st.markdown("#### 选择要开仓的币种")
-        syms = [c["symbol"] for c in cands]
-        dir_map = {c["symbol"]: c["direction"] for c in cands}
-        sel = st.selectbox("候选币种（按干净度评分从高到低）", syms, key="sel_sym")
-        dir_txt = "上升趋势 → 做多" if dir_map[sel] == 1 else "下降趋势 → 做空"
-        st.caption(f"该币当前为 **{dir_txt}**。开仓实际方向由机器人复核时的实时斜率决定，以机器人判定为准。")
-        st.caption("若复核不通过（趋势已不干净 / 资金费率超 0.1% 且逆费率方向），机器人会拒绝开仓并在运行日志中说明原因。")
-        agree = st.checkbox("我确认：全仓开单（可用余额 95% × 3 倍杠杆），由机器人复核趋势后自动执行")
-        st.caption(f"本次将发送的开仓币种：**{sel}**（请核对与下拉框一致再点击按钮）")
-        if st.button(f"✅ 确认开仓 {sel}", type="primary", disabled=not agree, use_container_width=True):
-            write_open_request(sel)
-            st.success(f"开仓请求已发送（{sel}），机器人将在下一轮（≤1 秒）复核后全仓开单。")
-        if os.path.exists(OPEN_REQUEST_FILE):
-            st.warning("⚠️ 已有待处理开仓请求，机器人处理前请勿重复发送。"
-                       "（若机器人暂停中或有持仓，请求会保留到恢复后处理）")
+@st.fragment(run_every=15)
+def process_check():
+    """机器人进程自检（低频刷新）：显示当前正在运行的 bot.py 数量与 PID/启动时间，
+    避免用户反复点击启动导致并发。放在程序控制区下方单独展示。"""
+    cnt, procs = detect_bot_processes()
+    if cnt < 0:
+        st.caption("❓ 进程自检失败（无法枚举进程），可直接点击下方“启动/停止”管理机器人。")
+    elif cnt == 0:
+        st.caption("🟡 进程自检：当前 **没有** 运行中的 bot.py 进程。")
+    elif cnt == 1:
+        st.caption(f"🟢 进程自检：**1 个** bot.py 运行中（PID {procs[0][0]}，启动于 {procs[0][1]}）。正常，无需再点启动。")
     else:
-        st.info("暂无扫描数据。机器人需处于空仓状态并完成一轮扫描（空仓后每 2 分钟一次）才会写入结果；"
-                "若正在持仓中，将保留上一次扫描结果或为空。")
-        st.caption("提示：机器人仍处于暂停状态时不会扫描，请在下方“程序控制”恢复交易。")
+        pids = "、".join(p[0] for p in procs)
+        st.error(f"🔴 进程自检：检测到 **{cnt} 个并发 bot.py 进程**（PID {pids}）！请清理多余进程，避免重复下单。")
+
+
+def scan_controls():
+    """扫描区（主流程，交互控件不进 fragment，避免自动刷新卡顿/回弹）：
+    扫描表由 scan_table_fragment 局部自动刷新。"""
+    st.subheader("🔍 高波动币扫描结果（top20，单 30 分钟窗口）")
+    st.caption("机器人每 15 秒扫描按日内振幅排序的前 20 只高波动永续合约（24h 成交量≥200万U），"
+               "对每只做 30 分钟窗口（1 分钟 K 线 × 30 根）趋势评分；评分 = R²×1000 + |斜率|×100000，越高趋势越干净。")
+
+    # ---------- 扫描表（纯展示，fragment 自动刷新，不影响上方交互控件）----------
+    scan_table_fragment()
+
+    st.info("🤖 自动组合持仓已启用：机器人持续扫描，评分>800 且候选队列较上次变化≥10% 时自动市价补仓"
+            "（每仓 6U 保证金 × 3x，不重复下单），最多持有 5 仓，余额不足自动停止。无需手动开仓。")
+
+
+@st.fragment(run_every=max(15, refresh_sec // 2))
+def scan_table_fragment():
+    """仅展示扫描结果表：单 30m 窗口评分 + 日内振幅列（纯数据，自动刷新）"""
+    scan = load_scan()
+    if not (scan and scan.get("candidates")):
+        return
+    cands = scan["candidates"]
+    scan_time = scan.get("time", "—")
+    df = pd.DataFrame(cands)
+    if df.empty:
+        return
+    df["方向"] = df["direction"].map({1: "做多（上升）", -1: "做空（下降）"})
+    df["现价"] = df["price"].map(lambda x: f"{x:.6f}")
+    df["日内振幅"] = df["ampl"].map(lambda x: f"{x:.1f}%") if "ampl" in df.columns else "—"
+    df["24h量(M U)"] = (df["vol"] / 1e6).map(lambda x: f"{x:.1f}")
+    df["扫描时间"] = scan_time
+    df["评分30m"] = df["score"].round(1)
+    df = df.sort_values("score", ascending=False, na_position="last")
+    show = df[["rank", "symbol", "方向", "评分30m", "现价", "日内振幅", "24h量(M U)", "扫描时间"]]
+    show.columns = ["#", "币种", "方向", "评分30m", "现价", "日内振幅", "24h量(M U)", "扫描时间"]
+    st.markdown(f"共发现 **{len(cands)}** 个干净趋势目标（近期高波动 top20 中满足 30m 窗口趋势门槛），按评分降序")
+    st.dataframe(show.set_index("#"), use_container_width=True, height=32 * (len(cands) + 1))
+    st.caption(f"扫描时间：{scan_time} | 评分 = R²×1000 + |斜率|×100000（30 分钟窗口，1 分钟 × 30 根）。"
+               f"**卖出规则（评分制）**：持仓期间跟踪最高评分，评分较峰值下降 **40%** 即平仓。每 15 秒更新一次。")
 
 
 # ================= 账户分析 =================
@@ -250,7 +323,11 @@ def account_section():
             return pd.DataFrame(), None
         with open(TRADE_LOG, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return pd.DataFrame(data.get("trades", [])), data.get("open_position", None)
+        # 兼容新多持仓 positions dict（旧版单持仓 open_position 迁移判断）
+        positions = data.get("positions") or {}
+        if not positions and data.get("open_position"):
+            positions = {data.get("symbol", "CARVUSDT"): data["open_position"]}
+        return pd.DataFrame(data.get("trades", [])), positions
 
     def load_pnl_history():
         """读取分时盈亏记录（bot.py 每轮轮询追加一条）"""
@@ -284,7 +361,7 @@ def account_section():
     df["fee"] = df["entry_fee"] + df["exit_fee"]
     total_fee = float(df["fee"].sum())
     if open_pos:
-        total_fee += float(open_pos.get("entry_fee", 0) or 0)
+        total_fee += sum(float(p.get("entry_fee", 0) or 0) for p in open_pos.values())
 
     realized_pnl = df["pnl"].sum() if not df.empty else 0
     total_trades = len(df)
@@ -301,9 +378,12 @@ def account_section():
 
     # ============ 浮动盈亏 ============
     if open_pos:
-        side_cn = "做多" if open_pos.get("side") == "LONG" else "做空"
-        otype_cn = ORDER_TYPE_CN.get(open_pos.get("order_type"), "—")
-        st.info(f"🟢 当前持仓中：{side_cn} {open_pos['qty']:.4f} {BASE_ASSET} @ {open_pos['price']:.4f}，名义 {open_pos['cost']:.2f} USDT（开仓方式：{otype_cn}）")
+        info_parts = []
+        for s, p in open_pos.items():
+            side_cn = "做多" if p.get("side") == "LONG" else "做空"
+            otype_cn = ORDER_TYPE_CN.get(p.get("order_type"), "—")
+            info_parts.append(f"**{s.replace('USDT','')}** {side_cn} {p.get('qty', 0):.4f}@{p.get('price', 0):.6f}({otype_cn})")
+        st.markdown(f"🟢 持仓中（{len(open_pos)} 仓）：{'　｜　'.join(info_parts)}")
     else:
         st.success("✅ 当前空仓，无浮动盈亏")
 
@@ -400,6 +480,7 @@ def account_section():
 
 if page == "智能操作台":
     status_section()
-    scan_section()
+    process_check()
+    scan_controls()
 else:
     account_section()

@@ -52,22 +52,27 @@ R2_ENTER = 0.75                                     # 进场 R² 阈值：趋势
 R2_EXIT = 0.40                                      # 离场 R² 阈值：跌破则认为趋势破坏 -> 空仓
 SLOPE_MIN_PCT = 0.0008                              # 进场最小斜率（每根K线价格变动比例）：低于此不进场
 SLOPE_EXIT_MIN = 0.0002                             # 离场最小斜率：斜率低于此视为走平 -> 空仓
-MIN_VOLUME = 2000000                                 # 空仓选币扫描：24h 成交量下限（USDT），过滤空气币
-SCAN_INTERVAL = 120                                   # 空仓时全市场扫描间隔（秒）：2 分钟扫一次
-SCAN_TOP_N = 10                                       # 扫描保留的前 N 个干净趋势目标（写入界面显示）
-SCAN_RESULTS_FILE = r"d:\bian\scan_results.json"     # 扫描结果（Top N）写入此文件，供可视化界面读取展示
+MIN_VOLUME = 2000000                                 # 选币扫描：24h 成交量下限（USDT），过滤空气币
+SCAN_INTERVAL = 15                                    # 只扫 top20 高波动币，扫描间隔（秒）：每 15 秒扫一轮
+SCAN_TOP_N = 20                                       # 扫描的高波动币数量：按日内振幅排序取前 20 只
+SCAN_RESULTS_FILE = r"d:\bian\scan_results.json"     # 扫描结果（Top 20）写入此文件，供可视化界面读取展示
+SCAN_PROGRESS_FILE = r"d:\bian\scan_progress.json"  # 扫描进度实时写入此文件（当前/总数/已发现/下次时间），供界面显示刷新进度
+QUEUE_SNAPSHOT_FILE = r"d:\bian\scan_queue_snapshot.json"  # 上次扫描候选队列快照（评分降序 symbol 列表），用于判断队列变化 ≥10% 触发补仓
+TOP20_POOL_FILE = r"d:\bian\top20_pool.json"      # 当日高波动 top20 候选池（每天更新一次），池内每 15 秒高频评分扫描
 OPEN_REQUEST_FILE = r"d:\bian\open_request.json"     # 可视化界面选定的开仓币种写入这里，机器人读取后开仓（开仓后自动删除）
 LAST_OPEN_NOTE = {"text": "", "time": ""}             # 最近一次界面开仓请求的处理结果（拒绝原因/成功信息），写入状态快照供界面显示
 STOP_FILE = r"d:\bian\stop_request.flag"             # 可视化界面"停止程序"按钮：存在此文件机器人优雅退出
 STATUS_FILE = r"d:\bian\bot_status.json"             # 每轮轮询写入运行状态快照（界面状态显示与心跳检测）
-LEVERAGE = 3                                        # 杠杆倍数（3x：名义金额=余额×95%×3，保证金只用余额的 95%）
-POSITION_RATIO = 0.95                               # 全仓开仓比例：每次用合约钱包可用余额的 95% 作为保证金（留 5% 缓冲给手续费）
-TP_USDT = 0.0                                       # 止盈阈值（USDT）：0 = 关闭止盈，>0 时浮动盈亏达到该值自动平仓锁利
-SL_USDT = 55.0                                      # 止损：浮动盈亏达到 -55 USDT 自动平仓止损
+LEVERAGE = 3                                        # 杠杆倍数（3x：每仓 6U 保证金 → 名义金额 ≈ 18U）
+TARGET_POSITIONS = 5                                # 自动组合持仓目标数：最多同时持有 5 个品种
+POS_MARGIN_USDT = 6.0                               # 每个品种下单保证金（USDT）固定 6U，×杠杆 = 名义金额
+ENTRY_SCORE = 800                                   # 自动开仓评分门槛：评分 > 800 才考虑补仓
+QUEUE_CHANGE_PCT = 0.10                             # 触发补仓的扫描队列变化阈值：本次候选队列较上次变化 ≥10% 才补仓
 TRAIL_PCT = 0.10                                    # 动态回撤止损/止盈：价格从入场以来最佳价（多=最高/空=最低）回撤达到 10% 即平仓（锁利或止损）
-FUNDING_RATE_LIMIT = 0.001                          # 资金费率监控阈值：|资金费率| 超过 0.1%（每8小时）且逆费率方向开仓时拒绝。
+SCORE_DROP_PCT = 0.40                               # 评分制卖出：持仓期间跟踪最高评分（R²×1000+|斜率|×100000），评分较峰值下降 40% 即平仓
+                                                    #   （从 25% 放宽到 40%，降低对实时评分抖动敏感度，减少"刚开就平"的手续费损耗；峰值用开仓当时实时评分口径）
+FUNDING_RATE_LIMIT = 0.005                          # 资金费率监控阈值：|资金费率| 超过 0.1%（每8小时）且逆费率方向开仓时拒绝。
                                                     #   资金费率正=多头付费给空头，负=空头付费给多头；顺费率方向开仓可收取资金费，不拦截
-PAUSE_FILE = r"d:\bian\manual_pause.flag"          # 手动暂停标记：检测到交易所仓位被外部改动时自动创建，恢复交易需删除此文件
 LIMIT_TIMEOUT = 4                                   # 限价单等待秒数：先挂 maker 价省手续费，超时未完全成交自动转市价兜底
 MAKER_FEE_RATE = 0.0002                             # 挂单成交（maker）手续费率
 TAKER_FEE_RATE = 0.0005                             # 吃单成交（taker）手续费率
@@ -103,9 +108,10 @@ client = ProxiedClient(API_KEY, API_SECRET, testnet=False)
 
 # ---------------- 合约辅助函数 ----------------
 
-def set_leverage():
+def set_leverage(symbol=None):
+    sym = symbol or SYMBOL
     try:
-        client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
+        client.futures_change_leverage(symbol=sym, leverage=LEVERAGE)
     except Exception as e:
         print(f"[警告] 设置杠杆失败（可能是仅减仓模式等）：{e}")
 
@@ -124,12 +130,13 @@ def ensure_one_way_mode():
         print(f"[警告] 检查/切换持仓模式失败：{e}")
 
 
-def futures_round_qty(qty, price):
+def futures_round_qty(qty, price, symbol=None):
     """按合约交易对允许的最小下单量取整，并保证名义价值 >= 最小下单要求"""
+    sym = symbol or SYMBOL
     step, min_notional = 0.1, 5.0
     info = client.futures_exchange_info()
     for s in info["symbols"]:
-        if s["symbol"] == SYMBOL:
+        if s["symbol"] == sym:
             for f in s["filters"]:
                 if f["filterType"] == "LOT_SIZE":
                     step = float(f["stepSize"])
@@ -145,12 +152,31 @@ def futures_round_qty(qty, price):
     return qty
 
 
-def get_position():
-    """返回当前持仓 (数量, 方向)。数量正=多 负=空，0=空仓"""
-    pos = client.futures_position_information(symbol=SYMBOL)
+def get_position(symbol=None):
+    """返回某品种当前持仓 (数量, 方向)。数量正=多 负=空，0=空仓"""
+    sym = symbol or SYMBOL
+    pos = client.futures_position_information(symbol=sym)
     amt = float(pos[0]["positionAmt"]) if pos else 0.0
     entry = float(pos[0]["entryPrice"]) if pos and amt else 0.0
     return amt, entry
+
+
+def get_all_positions():
+    """返回当前所有非零持仓 {symbol: {"amt":, "entry":, "unrealized":}}（单向模式，USD 本位永续）"""
+    out = {}
+    try:
+        for p in client.futures_position_information():
+            amt = float(p.get("positionAmt") or 0)
+            if amt != 0 and p.get("symbol", "").endswith("USDT"):
+                out[p["symbol"]] = {
+                    "amt": amt,
+                    "entry": float(p.get("entryPrice") or 0),
+                    "unrealized": float(p.get("unRealizedProfit") or 0),
+                    "side": "LONG" if amt > 0 else "SHORT",
+                }
+    except Exception:
+        pass
+    return out
 
 
 def get_wallet_balance():
@@ -164,115 +190,35 @@ def get_wallet_balance():
     return 0.0
 
 
-def calc_full_qty(price):
-    """全仓模式：用余额的 POSITION_RATIO 作为保证金，按 LEVERAGE 计算名义金额。
-    必须在本轮已平掉旧持仓之后调用，才能拿到平仓后的最新余额。"""
-    balance = get_wallet_balance()
-    notional = balance * POSITION_RATIO * LEVERAGE
-    qty = futures_round_qty(notional / price, price)
-    return qty, balance
-
-
-def market_order(qty, side):
-    """市价下单，返回 (成交数量, 平均成交价)。side: 'LONG' 买 / 'SHORT' 卖"""
+def market_order(qty, side, symbol=None):
+    """市价下单，返回 (成交数量, 平均成交价, 订单id)。side: 'LONG' 买 / 'SHORT' 卖"""
+    sym = symbol or SYMBOL
     order_side = Client.SIDE_BUY if side == "LONG" else Client.SIDE_SELL
     order = client.futures_create_order(
-        symbol=SYMBOL, side=order_side, type=Client.ORDER_TYPE_MARKET, quantity=qty
+        symbol=sym, side=order_side, type=Client.ORDER_TYPE_MARKET, quantity=qty
     )
     oid = order["orderId"]
     # 偶发：下单成功但响应缺成交字段（连接异常导致），回查订单补全
     if not order.get("avgPrice") or not order.get("executedQty"):
-        order = client.futures_get_order(symbol=SYMBOL, orderId=oid)
+        order = client.futures_get_order(symbol=sym, orderId=oid)
     return float(order["executedQty"]), float(order["avgPrice"]), oid
 
 
-def get_book_top(side):
-    """取盘口挂单价：开多/平空挂买一，开空/平多挂卖一，被动等成交（maker 手续费）"""
-    book = client.futures_order_book(symbol=SYMBOL, limit=5)
-    if side == "LONG":
-        return float(book["bids"][0][0])
-    else:
-        return float(book["asks"][0][0])
+def order_market_position(symbol, side, margin_usdt=POS_MARGIN_USDT):
+    """按固定保证金（默认 6U）× 杠杆，对指定 symbol **市价**开仓。
+    side: 'LONG'/'SHORT'。返回 (成交数量, 成交均价, 名义金额, 手续费估算)。
+    symbol 需为某 USDT 永续。"""
+    notional = margin_usdt * LEVERAGE
+    px = get_futures_price_for(symbol)
+    qty = futures_round_qty(notional / px, px, symbol)
+    fill_qty, fill_px, _ = market_order(qty, side, symbol)
+    fee = fill_qty * fill_px * TAKER_FEE_RATE
+    return fill_qty, fill_px, fill_qty * fill_px, fee
 
 
-def wait_fill_or_fallback(order, total_qty, side):
-    """混合下单核心：轮询等待限价单成交；超时未完全成交则取消，用市价补足差额。
-    返回 (实际成交数量, 加权平均价, 成交类型, 手续费估算)：
-      maker=限价全成交 / taker=全靠市价 / mixed=限价部分+市价补足"""
-    oid = order["orderId"]
-    filled, cost = 0.0, 0.0
-    limit_filled, limit_avg = 0.0, 0.0
-    for _ in range(int(LIMIT_TIMEOUT)):
-        st = client.futures_get_order(symbol=SYMBOL, orderId=oid)
-        status = st["status"]
-        if status == "FILLED":
-            limit_filled = float(st.get("executedQty", 0) or 0)
-            limit_avg = float(st.get("avgPrice", 0) or 0)
-            filled, cost = limit_filled, limit_filled * limit_avg
-            break
-        if status in ("CANCELED", "EXPIRED"):
-            break
-        time.sleep(1)
-    else:
-        # 超时未成交：取消限价单，避免后续与信号冲突
-        try:
-            client.futures_cancel_order(symbol=SYMBOL, orderId=oid)
-        except Exception:
-            pass
-        st = client.futures_get_order(symbol=SYMBOL, orderId=oid)
-        limit_filled = float(st.get("executedQty", 0) or 0)
-        limit_avg = float(st.get("avgPrice", 0) or 0)
-        filled, cost = limit_filled, limit_filled * limit_avg
-    # 差额用市价补足
-    remain = total_qty - filled
-    market_filled, market_cost = 0.0, 0.0
-    if remain > 0:
-        q2, p2, _ = market_order(remain, side)
-        market_filled, market_cost = q2, p2 * q2
-        filled += q2
-        cost += market_cost
-    avg = cost / filled if filled else 0.0
-    # 手续费估算：限价部分按 maker 费率，市价补足部分按 taker 费率
-    fee = limit_filled * limit_avg * MAKER_FEE_RATE + market_cost * TAKER_FEE_RATE
-    if limit_filled <= 0:
-        otype = "taker"
-    elif remain > 0:
-        otype = "mixed"
-    else:
-        otype = "maker"
-    return filled, avg, otype, fee
-
-
-def smart_open(side, qty):
-    """混合开仓：先挂限价（maker 手续费），超时未成交转市价。返回 (成交数量, 均价, 成交类型)"""
-    px = get_book_top(side)
-    qty = futures_round_qty(qty, px)
-    order_side = Client.SIDE_BUY if side == "LONG" else Client.SIDE_SELL
-    order = client.futures_create_order(
-        symbol=SYMBOL, side=order_side, type=Client.ORDER_TYPE_LIMIT,
-        quantity=qty, price=px, timeInForce=Client.TIME_IN_FORCE_GTC,
-    )
-    return wait_fill_or_fallback(order, qty, side)
-
-
-def smart_close(qty, position_side):
-    """混合平仓：先挂限价（maker 手续费），超时未成交转市价。
-    position_side: 被平仓位方向（持多平多传 'LONG'，持空平空传 'SHORT'）。
-    返回 (成交数量, 均价, 成交类型)"""
-    close_side = "SHORT" if position_side == "LONG" else "LONG"  # 平多卖、平空买
-    px = get_book_top(close_side)
-    qty = futures_round_qty(qty, px)
-    order_side = Client.SIDE_SELL if close_side == "SHORT" else Client.SIDE_BUY
-    order = client.futures_create_order(
-        symbol=SYMBOL, side=order_side, type=Client.ORDER_TYPE_LIMIT,
-        quantity=qty, price=px, timeInForce=Client.TIME_IN_FORCE_GTC,
-    )
-    return wait_fill_or_fallback(order, qty, close_side)
-
-
-def get_futures_price():
-    """取合约最新价（用合约 K 线，与策略数据同源）"""
-    klines = client.futures_klines(symbol=SYMBOL, interval=INTERVAL, limit=1)
+def get_futures_price_for(symbol):
+    """取指定合约最新价（用合约 K 线）"""
+    klines = client.futures_klines(symbol=symbol, interval=INTERVAL, limit=1)
     return float(klines[0][4])
 
 
@@ -285,49 +231,6 @@ def get_funding_rate(symbol):
     except Exception as e:
         print(f"[警告] 资金费率查询失败（{symbol}）：{e}")
         return None
-
-
-def check_tp_sl(amt, entry, price):
-    """止盈止损检查：按当前浮动盈亏判断是否触发（TP_USDT/SL_USDT 为 0 时对应功能关闭）。
-    返回 'TP'（止盈）/ 'SL'（止损）/ None（未触发）"""
-    if not amt or not entry:
-        return None
-    side = 1 if amt > 0 else -1
-    floating = (price - entry) * abs(amt) * side
-    if SL_USDT > 0 and floating <= -SL_USDT:
-        return "SL"
-    if TP_USDT > 0 and floating >= TP_USDT:
-        return "TP"
-    return None
-
-
-def check_trailing(rec_pos, amt, price):
-    """动态回撤止损/止盈：跟踪入场以来最佳价格（多=最高价，空=最低价），
-    当前价从最佳价回撤达 TRAIL_PCT（10%）即触发平仓。
-    返回 (触发?, 本轮最新最佳价, 当前回撤幅度)"""
-    if not rec_pos or not amt:
-        return False, 0.0, 0.0
-    best = float(rec_pos.get("best_price", rec_pos["price"]))
-    if amt > 0:  # 做多：最佳价=最高价
-        if price > best:
-            best = price
-        drawdown = (best - price) / best if best > 0 else 0.0
-    else:        # 做空：最佳价=最低价
-        if price < best:
-            best = price
-        drawdown = (price - best) / best if best > 0 else 0.0
-    return drawdown >= TRAIL_PCT, best, drawdown
-
-
-def is_paused():
-    """是否处于手动暂停状态（检测到交易所仓位被外部改动后自动暂停）"""
-    return os.path.exists(PAUSE_FILE)
-
-
-def pause_bot(reason):
-    """写入暂停标记文件，机器人停止自动交易直到用户恢复"""
-    with open(PAUSE_FILE, "w", encoding="utf-8") as f:
-        f.write(f"{reason} @ {datetime.datetime.now()}\n")
 
 
 # ---------------- 策略逻辑 ----------------
@@ -361,27 +264,58 @@ def linreg(prices):
     return slope / ybar, r2
 
 
+def scan_windows(symbol):
+    """拉取 30 根 1 分钟 K 线（覆盖最近 30 分钟），回归评分单一 30 分钟窗口 + 日内振幅。
+    返回 dict：{"score","r2","slope_pct","direction","ampl"}（ampl=30 分钟窗口内振幅%）；失败返回 {}"""
+    try:
+        klines = client.futures_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_1MINUTE, limit=31)
+    except Exception:
+        return {}
+    if len(klines) < 30:
+        return {}
+    closes = [float(k[4]) for k in klines[-30:]]
+    # 日内振幅：窗口内（最高-最低）/现价（%），供界面评估波动强度（用于 top20 高波动排序）
+    hi = max(float(k[2]) for k in klines[-30:])
+    lo = min(float(k[3]) for k in klines[-30:])
+    last_px = closes[-1]
+    ampl = (hi - lo) / last_px * 100 if last_px > 0 else 0.0
+    slope_pct, r2 = linreg(closes)
+    return {"slope_pct": slope_pct, "r2": r2,
+            "score": r2 * 1000 + abs(slope_pct) * 100000,  # R² 优先，斜率次之
+            "direction": 1 if slope_pct > 0 else -1,
+            "ampl": ampl}
+
+
+def score_for(symbol):
+    """按单一 30m 窗口（60 根 30m）计算某币评分与方向、最新价，用于持仓管理与自动补仓。
+    返回 dict：{score, direction('LONG'/'SHORT'), price}；失败返回 None。"""
+    wins = scan_windows(symbol)
+    if not wins:
+        return None
+    score = float(wins.get("score") or 0)
+    direction = "LONG" if wins.get("direction", 1) > 0 else "SHORT"
+    # 取最新价
+    try:
+        klines = client.futures_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_1MINUTE, limit=1)
+        price = float(klines[0][4])
+    except Exception:
+        price = 0.0
+    return {"score": score, "direction": direction, "price": price}
+
+
 def window_interval():
-    """当前趋势窗口自动选择 K 线周期，确保约 60 根 K 线参与回归与持仓管理：
-    1 小时→1m×60 根、3 小时→3m×60 根、6 小时→5m×72 根、12 小时→15m×48 根。"""
-    h = WINDOW_HOURS
-    if h <= 1:
-        return Client.KLINE_INTERVAL_1MINUTE, 60
-    if h <= 3:
-        return Client.KLINE_INTERVAL_3MINUTE, 60
-    if h <= 6:
-        return Client.KLINE_INTERVAL_5MINUTE, int(h * 12)
-    return Client.KLINE_INTERVAL_15MINUTE, int(h * 4)
+    """当前趋势窗口：1 分钟 K 线 × 30 根（覆盖最近 30 分钟），单一窗口。"""
+    return Client.KLINE_INTERVAL_1MINUTE, 30
 
 
 def window_bars():
-    """当前趋势窗口对应的 K 线根数（周期随窗口小时数自动选择，约 60 根）"""
+    """当前趋势窗口对应的 K 线根数（固定 30 根）"""
     return window_interval()[1]
 
 
 def interval_minutes():
-    """当前趋势窗口选用的 K 线周期分钟数（用于斜率阈值折算）"""
-    return {"1m": 1, "3m": 3, "5m": 5, "15m": 15}[window_interval()[0]]
+    """当前趋势窗口选用的 K 线周期分钟数（固定 1 分钟，用于斜率阈值折算）"""
+    return 1
 
 
 def slope_min():
@@ -401,88 +335,143 @@ def check_signal():
     return slope_pct, r2, close_prices(1)[0]
 
 
-def trend_break_progress(r2, slope_pct):
-    """趋势破坏进度 0~100 分：0 = 刚进场（趋势最干净），100 = 趋势破坏（触发平仓）。
-    平仓条件为 R² 跌破 R2_EXIT 或 |斜率| 跌破 SLOPE_EXIT_MIN（任一先触发即平仓），
-    故以两个维度中破坏更严重者计分；仍在进场阈值之上时记为 0 分。"""
-    a_slope = abs(slope_pct)
-    p_r2 = 0.0
-    if r2 < R2_ENTER and R2_ENTER > R2_EXIT:
-        p_r2 = min(1.0, max(0.0, (R2_ENTER - r2) / (R2_ENTER - R2_EXIT)))
-    p_slope = 0.0
-    if a_slope < slope_min() and slope_min() > slope_exit():
-        p_slope = min(1.0, max(0.0, (slope_min() - a_slope) / (slope_min() - slope_exit())))
-    return min(100, round(max(p_r2, p_slope) * 100))
+def trend_score(r2, slope_pct):
+    """趋势评分 = R²×1000 + |斜率|×100000（与界面/扫描/回测同口径），越高趋势越干净"""
+    return r2 * 1000 + abs(slope_pct) * 100000
 
 
-def scan_top(limit=SCAN_TOP_N):
-    """空仓时扫描全市场，按"干净度"（R² 优先，其次斜率强度）返回前 limit 个干净趋势目标。
-    返回 list[dict]（symbol/r2/slope_pct/price/vol/score/direction）"""
+def trend_break_progress(score, peak_score):
+    """评分回撤进度 0~100 分：0 = 评分在峰值（趋势最干净），100 = 评分较峰值下降达到
+    SCORE_DROP_PCT（触发评分回撤平仓）。峰值=持仓期间最高评分。"""
+    if not peak_score or peak_score <= 0:
+        return 0
+    drop_ratio = max(0.0, (peak_score - score) / peak_score)
+    return min(100, round(drop_ratio / SCORE_DROP_PCT * 100))
+
+
+def _write_scan_progress(phase, current=0, total=0, found=0, next_ts=0):
+    """写入扫描进度快照，供界面实时显示扫描执行情况"""
+    try:
+        with open(SCAN_PROGRESS_FILE, "w", encoding="utf-8") as f:
+            json.dump({"phase": phase, "current": current, "total": total,
+                       "found": found, "next_ts": next_ts,
+                       "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}, f,
+                      ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def ensure_top20_pool():
+    """每日只更新一次高波动 top20 候选池：按日内振幅（24h 高点-低点/现价）排序取前 SCAN_TOP_N 只。
+    当天已选过则直接复用池文件（不重复全市场拉取），次日自动重选。
+    返回当且候选池 symbol 列表；失败返回 []。"""
+    today = datetime.date.today().isoformat()
+    # 已是今天选过的池，直接复用
+    try:
+        with open(TOP20_POOL_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        if d.get("date") == today and d.get("symbols"):
+            return d["symbols"]
+    except Exception:
+        pass
+    # 重新选池：全市场拉取一次，按振幅排序
     try:
         info = client.futures_exchange_info()
         tickers = {t["symbol"]: {"qv": float(t.get("quoteVolume", 0) or 0),
-                                 "px": float(t.get("lastPrice", 0) or 0)} for t in client.futures_ticker()}
+                                 "px": float(t.get("lastPrice", 0) or 0),
+                                 "high": float(t.get("highPrice", 0) or 0),
+                                 "low": float(t.get("lowPrice", 0) or 0)} for t in client.futures_ticker()}
     except Exception:
         return []
-    cands = []
-    for s in info["symbols"]:
-        if s["contractType"] != "PERPETUAL" or s["status"] != "TRADING" or s["quoteAsset"] != "USDT":
-            continue
-        sym = s["symbol"]
-        tk = tickers.get(sym)
-        if not tk or tk["qv"] < MIN_VOLUME:
-            continue
+    eligible = [s for s in info["symbols"]
+                if s["contractType"] == "PERPETUAL" and s["status"] == "TRADING"
+                and s["quoteAsset"] == "USDT"
+                and tickers.get(s["symbol"], {}).get("qv", 0) >= MIN_VOLUME]
+
+    def amp(sym):
+        tk = tickers.get(sym, {})
+        hi, lo, px = tk.get("high", 0), tk.get("low", 0), tk.get("px", 0)
+        return (hi - lo) / px * 100 if px > 0 and hi > 0 else 0.0
+
+    top = sorted(eligible, key=lambda s: -amp(s["symbol"]))[: SCAN_TOP_N]
+    syms = [s["symbol"] for s in top]
+    if syms:
         try:
-            slope_pct, r2 = linreg(close_prices(window_bars(), sym))
-            if r2 >= R2_ENTER and abs(slope_pct) >= slope_min():
-                cands.append({"symbol": sym, "r2": r2, "slope_pct": slope_pct,
-                              "price": tk["px"], "vol": tk["qv"],
-                              "score": r2 * 1000 + abs(slope_pct) * 100000,  # R² 优先，斜率次之
-                              "direction": 1 if slope_pct > 0 else -1})
+            with open(TOP20_POOL_FILE, "w", encoding="utf-8") as f:
+                json.dump({"date": today, "symbols": syms, "picked": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
+                          f, ensure_ascii=False, indent=2)
+            print(f"[池] 今日高波动 top{len(syms)} 候选池已更新：{' '.join(s.replace('USDT','') for s in syms)}", flush=True)
         except Exception:
-            continue
+            pass
+    return syms
+
+
+def scan_top(limit=None):
+    """对当日高波动 top20 候选池（ensure_top20_pool，每天一次）逐一做单一 30m 窗口评分。
+    入选条件：30m 窗口满足进场要求（R²>=R2_ENTER 且 |斜率|>=该周期折算阈值）。
+    返回 list[dict]，含 score/r2/slope/direction/ampl 等字段，评分降序。界面按评分排序展示。
+    扫描过程中实时写入 SCAN_PROGRESS_FILE，供界面显示进度。"""
+    pool = ensure_top20_pool()
+    if not pool:
+        _write_scan_progress("error")
+        return []
+    # 拉一次行情用于价格/成交量/振幅展示（复用池，无需每天重选）
+    try:
+        tickers = {t["symbol"]: {"qv": float(t.get("quoteVolume", 0) or 0),
+                                 "px": float(t.get("lastPrice", 0) or 0),
+                                 "high": float(t.get("highPrice", 0) or 0),
+                                 "low": float(t.get("lowPrice", 0) or 0)} for t in client.futures_ticker()}
+    except Exception:
+        _write_scan_progress("error")
+        return []
+
+    def amp(sym):
+        tk = tickers.get(sym, {})
+        hi, lo, px = tk.get("high", 0), tk.get("low", 0), tk.get("px", 0)
+        return (hi - lo) / px * 100 if px > 0 and hi > 0 else 0.0
+
+    total = len(pool)
+    cands = []
+    m = interval_minutes()  # 30 分钟窗口，斜率阈值按周期折算
+    for i, sym in enumerate(pool, 1):
+        tk = tickers.get(sym, {})
+        wins = scan_windows(sym)
+        if wins:
+            if wins["r2"] >= R2_ENTER and abs(wins["slope_pct"]) >= SLOPE_MIN_PCT * m / 15.0:
+                cands.append({
+                    "symbol": sym,
+                    "price": tk["px"], "vol": tk["qv"],
+                    "ampl": wins.get("ampl", amp(sym)),      # 日内振幅（%），供界面展示与排序
+                    "r2": wins["r2"], "slope_pct": wins["slope_pct"],
+                    "score": wins["score"], "direction": wins["direction"],
+                })
         time.sleep(0.02)  # 防接口限频
+        # 每约 5 只写一次进度（top20 很快，保持界面流畅）
+        if i % 5 == 0 or i == total:
+            _write_scan_progress("scanning", current=i, total=total, found=len(cands))
     cands.sort(key=lambda c: -c["score"])
-    return cands[:limit]
+    result = cands if limit is None else cands[:limit]
+    _write_scan_progress("done", current=total, total=total, found=len(result),
+                         next_ts=time.time() + SCAN_INTERVAL)
+    return result
 
 
-def verify_symbol(sym):
-    """确认前复核某币当前是否仍是干净趋势。返回 (ok, slope_pct, r2, last)"""
-    try:
-        slope_pct, r2 = linreg(close_prices(window_bars(), sym))
-        last = close_prices(1, sym)[0]
-        return (r2 >= R2_ENTER and abs(slope_pct) >= slope_min()), slope_pct, r2, last
-    except Exception:
-        return False, 0.0, 0.0, 0.0
-
-
-def pause_reason():
-    """读取暂停标记内容（手动操作类型），未暂停返回空串"""
-    if not os.path.exists(PAUSE_FILE):
-        return ""
-    try:
-        with open(PAUSE_FILE, "r", encoding="utf-8") as f:
-            return f.read().strip()
-    except Exception:
-        return "暂停中"
-
-
-def write_status(now, price, realized, floating, total, signal_str, pos_str, paused, last_scan_str, cand_count, break_score):
-    """每轮轮询写入运行状态快照，供可视化界面显示状态与心跳检测"""
+def write_status(now, realized, floating, total, signal_str, positions, last_scan_str, cand_count, avg_break_score):
+    """每轮轮询写入运行状态快照，供可视化界面显示状态与心跳检测。
+    positions: dict{symbol: pos}，avg_break_score: 各持仓评分回撤进度均值（用于状态卡片展示）。"""
     st_data = {
         "time": now,
         "symbol": SYMBOL,
-        "price": price,
+        "balance": get_wallet_balance(),
         "realized": realized,
         "floating": floating,
         "total": total,
         "signal": signal_str,
-        "position": pos_str,
-        "balance": get_wallet_balance(),
-        "paused": paused,
+        "position": "\n".join(f"{s}:{p.get('side','?')}" for s, p in positions.items()) or "空仓",
+        "positions": positions,               # 多持仓 dict，界面读取展示表格
         "last_scan": last_scan_str,
         "candidate_count": cand_count,
-        "break_score": break_score,   # 趋势破坏进度 0~100：0=刚进场 100=触发趋势破坏平仓
+        "break_score": avg_break_score,       # 各持仓评分回撤进度均值 0~100
         "open_note": LAST_OPEN_NOTE.get("text", ""),      # 最近一次开仓请求的处理结果（拒绝原因/成功），界面展示
         "open_note_time": LAST_OPEN_NOTE.get("time", ""), # 该结果产生的时间
     }
@@ -493,31 +482,42 @@ def write_status(now, price, realized, floating, total, signal_str, pos_str, pau
 # ---------------- 交易记录与盈亏 ----------------
 
 def load_trades():
+    """读取交易记录。返回 (trades 列表, positions dict{symbol:pos}, 主symbol)。
+    兼容旧版单持仓 open_position 字段（迁移为 positions）。"""
     if not os.path.exists(TRADE_LOG):
-        return [], None, None
+        return [], {}, ""
     try:
         with open(TRADE_LOG, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return data.get("trades", []), data.get("open_position", None), data.get("symbol")
+        trades = data.get("trades", [])
+        positions = data.get("positions", {}) or {}
+        # 旧版单持仓兼容：把 open_position 迁移进 positions
+        if not positions and data.get("open_position"):
+            old = data["open_position"]
+            sym = data.get("symbol", "CARVUSDT")
+            positions[sym] = old
+        return trades, positions, data.get("symbol", "")
     except Exception:
-        return [], None, None
+        return [], {}, ""
 
 
-def save_trades(trades, open_position):
+def save_trades(trades, positions):
+    """持久化交易记录：trades 历史列表 + positions 多持仓 dict。全仓共享余额，symbol 记录主标的便于界面定位。"""
     with open(TRADE_LOG, "w", encoding="utf-8") as f:
-        json.dump({"trades": trades, "open_position": open_position, "symbol": SYMBOL},
+        json.dump({"trades": trades, "positions": positions, "symbol": SYMBOL},
                   f, ensure_ascii=False, indent=2)
 
 
-def calc_pnl(trades, open_position, current_price):
-    """盈亏：已实现 + 浮动"""
+def calc_pnl(trades, positions, prices_map):
+    """盈亏：已实现 + 多持仓浮动总和。prices_map: {symbol: 最新价}。"""
     realized = sum(t.get("pnl", 0) for t in trades)
     floating = 0.0
-    if open_position:
-        qty = open_position["qty"]
-        entry = open_position["price"]
-        side = 1 if open_position["side"] == "LONG" else -1
-        floating = (current_price - entry) * qty * side
+    for sym, pos in (positions or {}).items():
+        qty = pos.get("qty") or 0
+        entry = pos.get("price") or 0
+        px = prices_map.get(sym, entry)
+        side = 1 if pos.get("side") == "LONG" else -1
+        floating += (px - entry) * qty * side
     return realized, floating, realized + floating
 
 
@@ -549,7 +549,7 @@ def append_pnl_history(now, price, realized, floating, total, signal, position):
 # ---------------- 主循环 ----------------
 
 def make_close_record(rec_pos, qty, fill_px, otype, fee, side, now_str, reason=""):
-    """生成一条平仓交易记录（多/空通用）。reason 可为 '趋势破坏'/'趋势翻转'/'止盈'/'止损' 等"""
+    """生成一条平仓交易记录（多/空通用）。reason 可为 '评分回撤'/'止盈'/'止损'/'动态回撤' 等"""
     if side == "LONG":
         pnl = (fill_px - rec_pos["price"]) * qty if rec_pos else 0.0
         buy_cost = rec_pos["cost"] if rec_pos else qty * fill_px
@@ -580,24 +580,119 @@ def make_close_record(rec_pos, qty, fill_px, otype, fee, side, now_str, reason="
         rec["reason"] = reason
     return rec
 
+
+def market_close_position(symbol, qty, position_side):
+    """按指定 symbol **市价**平仓。position_side: 被平仓位方向'LONG'/'SHORT'。
+    返回 (成交数量, 成交均价, 名义成交额, 手续费估算)。"""
+    close_side = "SHORT" if position_side == "LONG" else "LONG"  # 平多卖、平空买
+    qty = futures_round_qty(qty, get_futures_price_for(symbol), symbol)
+    fill_qty, fill_px, _ = market_order(qty, close_side, symbol)
+    fee = fill_qty * fill_px * TAKER_FEE_RATE
+    return fill_qty, fill_px, fill_qty * fill_px, fee
+
+
+# ---------------- 多持仓组合：队列快照与补仓 ----------------
+
+def load_queue_snapshot():
+    """读取上次扫描候选队列快照（评分降序 symbol 列表）；无则返回空列表"""
+    try:
+        with open(QUEUE_SNAPSHOT_FILE, "r", encoding="utf-8") as f:
+            return list(json.load(f).get("queue", []))
+    except Exception:
+        return []
+
+
+def save_queue_snapshot(queue):
+    """持久化本次扫描候选队列快照（评分降序 symbol 列表）"""
+    try:
+        with open(QUEUE_SNAPSHOT_FILE, "w", encoding="utf-8") as f:
+            json.dump({"time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "queue": queue},
+                      f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def queue_change_pct(last_queue, cur_queue):
+    """队列变化程度（Jaccard 差异）：(|A∪B| - |A∩B|) / |A∪B|。0=相同，1=完全不同。
+    返回 0~1 的小数。任一为空视为 1.0（全新队列）。"""
+    if not last_queue:
+        return 1.0
+    if not cur_queue:
+        return 0.0
+    sa, sb = set(last_queue), set(cur_queue)
+    inter = len(sa & sb)
+    union = len(sa | sb)
+    if union == 0:
+        return 0.0
+    return (union - inter) / union
+
+
+def get_max_margin():
+    """估算单仓 6U 保证金 × 杠杆下的名义金额（用于补仓判断）"""
+    return POS_MARGIN_USDT * LEVERAGE
+
+
+def replenish_positions(now, cands, positions, trades):
+    """自动补仓：当前持仓数 < 目标数时，从达标队列（评分>ENTRY_SCORE、未持仓、未反向）按评分降序
+    逐个市价开 6U 仓，直到满仓或资金不足。返回新持仓数量或 None 表示资金不足需停止。"""
+    held = set(positions.keys())
+    # 交易所当前已有但本地未记录的仓位也视为已持有（避免重复开）
+    for sym, p in get_all_positions().items():
+        held.add(sym)
+    # 候选评分降序、过滤评分门槛与已持有
+    candidates = [c for c in cands
+                  if c["symbol"] not in held
+                  and c.get("score", 0) > ENTRY_SCORE]
+    candidates.sort(key=lambda c: -c["score"])
+    for c in candidates:
+        if len(positions) >= TARGET_POSITIONS:
+            break
+        sym = c["symbol"]
+        side = "LONG" if c.get("direction", 1) > 0 else "SHORT"
+        balance = get_wallet_balance()
+        # 每仓保证金 6U：余额需 ≥ POS_MARGIN_USDT（留手续费缓冲），否则资金不足停止
+        if balance < POS_MARGIN_USDT * 1.1:
+            print(f"[{now}] [补仓] 余额 {balance:.2f}U 不足以再开一仓（需 ≥{POS_MARGIN_USDT*1.1:.1f}U），停止补仓", flush=True)
+            return None
+        try:
+            set_leverage(sym)
+            fill_qty, fill_px, notional, fee = order_market_position(sym, side)
+            if fill_qty <= 0:
+                print(f"[{now}] [补仓] {sym} 市价开仓未成交，跳过", flush=True)
+                continue
+            # 峰值评分用开仓当时实时评分（与持仓管理同函数同 1h 口径），避免扫描候选"最佳窗口"高分
+            # 与实时 1h 评分差异过大而刚开仓就触发回撤平仓
+            si = score_for(sym)
+            peak = si["score"] if si else c.get("score", 0)
+            positions[sym] = {
+                "time": now, "side": side, "qty": fill_qty, "price": fill_px,
+                "cost": fill_qty * fill_px, "notional": notional,
+                "order_type": "taker", "entry_fee": fee,
+                "best_price": fill_px, "peak_score": peak,
+                "entry_score": c.get("score", 0),
+            }
+            save_trades(trades, positions)
+            print(f"[{now}] >>> 自动开{('多' if side=='LONG' else '空')} {sym} {fill_qty} @ {fill_px:.6f}（名义 {notional:.2f}U，保证金 {POS_MARGIN_USDT:.0f}U，市价·taker）", flush=True)
+        except Exception as e:
+            print(f"[{now}] [补仓] {sym} 开仓失败：{e}", flush=True)
+            continue
+    return len(positions)
+
+
 def main():
-    global SYMBOL, BASE_ASSET, WINDOW_HOURS  # 空仓换币时动态切换交易对；趋势窗口由界面选择动态生效
-    trades, open_position, saved_symbol = load_trades()
+    global SYMBOL, BASE_ASSET, WINDOW_HOURS  # 趋势窗口由界面选择动态生效；SYMBOL 为界面展示主标的
+    trades, positions, saved_symbol = load_trades()
     if saved_symbol and saved_symbol.endswith("USDT"):
-        SYMBOL = saved_symbol  # 重启后恢复上次实际交易对，避免错管/漏管持仓
+        SYMBOL = saved_symbol  # 恢复上次主标的（用于界面展示与持仓恢复定位）
         BASE_ASSET = SYMBOL.replace("USDT", "")
-        print(f"已恢复上次交易对：{SYMBOL}")
-    set_leverage()
+        print(f"已恢复主标的：{SYMBOL} | 当前持仓 {len(positions)} 个")
     ensure_one_way_mode()
-    print(f"机器人启动 | {SYMBOL} 斜率趋势策略 | 趋势窗口 最近{WINDOW_HOURS}小时（界面可选 1/3/6/12）| 杠杆 {LEVERAGE}x | 全仓模式（保证金用余额的 {POSITION_RATIO*100:.0f}%）| 止盈 {'关闭' if TP_USDT <= 0 else f'{TP_USDT:.0f}U'} / 止损 {SL_USDT if SL_USDT > 0 else '关闭'} | 动态回撤 {TRAIL_PCT*100:.0f}%（从最佳价回撤即平仓）| 资金费率监控（|费率|>{FUNDING_RATE_LIMIT*100:.1f}% 逆方向拒开）| 下单：限价优先（maker），超时 {LIMIT_TIMEOUT}s 转市价 | 空仓时每 {SCAN_INTERVAL}s 扫描全市场 Top{SCAN_TOP_N} 干净趋势目标，开仓需在可视化界面确认，清仓自动 | 界面停止：创建 {os.path.basename(STOP_FILE)}")
-    print(f"合约钱包 USDT 余额: {get_wallet_balance():.2f}")
-    print(f"当前持仓: {'记录有持仓' if open_position else '记录空仓'} | 历史已平仓 {len(trades)} 笔")
-    if is_paused():
-        print(f"[警告] 存在暂停标记（{os.path.basename(PAUSE_FILE)}），机器人启动后保持暂停状态，删除该文件后恢复自动交易")
-    risk_exit_side = None  # 止盈/止损离场方向：同方向不立即重进，等信号翻向对面再开仓
-    last_scan = 0  # 空仓扫描上次执行时间（0 = 启动后立即首次扫描）
+    print(f"机器人启动 | 多品种自动组合持仓策略 | 目标持仓 {TARGET_POSITIONS} 个 | 每仓保证金 {POS_MARGIN_USDT:.0f}U × {LEVERAGE}x（名义≈{POS_MARGIN_USDT*LEVERAGE:.0f}U）| 自动开仓评分>{ENTRY_SCORE} | 队列变化≥{QUEUE_CHANGE_PCT*100:.0f}% 触发补仓 | 卖出=评分较峰值下降 {SCORE_DROP_PCT*100:.0f}%（市价平仓）| 市价下单 | 全仓共享余额 | 界面停止：创建 {os.path.basename(STOP_FILE)}")
+    print(f"合约钱包 USDT 余额: {get_wallet_balance():.2f} | 历史已平仓 {len(trades)} 笔")
+    last_scan = 0  # 上次全市场扫描时间（0 = 启动后立即首次扫描）
     last_scan_str = "启动后未扫描"  # 上次扫描时间字符串（写入状态文件供界面显示）
     cand_count = 0  # 上次扫描到的干净目标数量
+    last_queue = load_queue_snapshot()  # 上次扫描候选队列快照（评分降序 symbol 列表）
     while True:
         try:
             now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -616,191 +711,103 @@ def main():
                         wh = json.load(f).get("hours")
                     if wh in WINDOW_OPTIONS and wh != WINDOW_HOURS:
                         WINDOW_HOURS = wh
-                        print(f"[{now}] 趋势窗口已切换为最近 {WINDOW_HOURS} 小时（{window_bars()} 根 {window_interval()[0]} K线），下一轮扫描/信号将按新窗口计算", flush=True)
+                        print(f"[{now}] 趋势窗口已切换为最近 {WINDOW_HOURS} 小时", flush=True)
                 except Exception:
                     pass
-            slope_pct, r2, last = check_signal()
-            brk_score = trend_break_progress(r2, slope_pct)
-            trend_ok = (r2 >= R2_ENTER) and (abs(slope_pct) >= slope_min())
-            sig_dir = (1 if slope_pct > 0 else -1) if trend_ok else 0
-            signal_str = {1: "多", -1: "空", 0: "观望"}[sig_dir]
-            realized, floating, total = calc_pnl(trades, open_position, last)
-            pos_str = f"{open_position['side']}" if open_position else "空仓"
-            print(f"[{now}] {SYMBOL} {last:.4f} | 斜率 {slope_pct*100:+.4f}%/根 | R² {r2:.2f} | 信号{signal_str} | 持仓{pos_str} | 趋势破坏进度 {brk_score}分 | 已实现 {realized:.2f}U | 浮动 {floating:+.2f}U | 总盈亏 {total:+.2f}U",
-                  flush=True)
 
-            append_pnl_history(now, last, realized, floating, total, signal_str, pos_str)
+            # ============ 一、管理各持仓：评分回撤达 SCORE_DROP_PCT 即市价平仓 ============
+            act_positions = get_all_positions()   # 交易所实际持仓
+            prices = {}                            # 各持仓最新价缓存
+            for sym in list(positions.keys()):
+                si = score_for(sym)
+                px = si["price"] if si else 0.0
+                score = si["score"] if si else 0.0
+                # 该品种在交易所已无实际仓位：同步移除本地记录（可能被外部平掉）
+                if sym not in act_positions:
+                    del positions[sym]
+                    save_trades(trades, positions)
+                    print(f"[{now}] [持仓] {sym} 交易所已无仓位，移除本地记录", flush=True)
+                    continue
+                if si is None:
+                    continue
+                prices[sym] = px
+                pos = positions[sym]
+                # 更新峰值评分
+                peak = float(pos.get("peak_score") or score)
+                if score > peak:
+                    peak = score
+                    pos["peak_score"] = peak
+                # 评分回撤触发 -> 市价平仓
+                if peak > 0 and score <= peak * (1 - SCORE_DROP_PCT):
+                    pos_side = pos["side"]
+                    qt = abs(float(pos.get("qty") or act_positions[sym]["amt"]))
+                    fq, fp, _nv, fee = market_close_position(sym, qt, pos_side)
+                    trades.append(make_close_record(pos, fq, fp, "taker", fee, pos_side, now, "评分回撤"))
+                    del positions[sym]
+                    save_trades(trades, positions)
+                    print(f"[{now}] >>> 评分回撤平{('多' if pos_side=='LONG' else '空')} {sym} @ {fp:.6f}（市价），评分 {score:.0f} 较峰值降 {(peak-score)/peak*100:.1f}%，盈亏 {trades[-1]['pnl']:+.2f}U", flush=True)
+            save_trades(trades, positions)
 
-            amt, entry = get_position()  # 实际交易所持仓
-            rec_pos = open_position       # 本地记录持仓
+            # ============ 二、汇总浮动盈亏 ============
+            realized = sum(t.get("pnl", 0) for t in trades)
+            floating = 0.0
+            for sym, pos in positions.items():
+                qty = pos.get("qty") or 0
+                entry = pos.get("price") or 0
+                px = prices.get(sym) or get_futures_price_for(sym)
+                side = 1 if pos.get("side") == "LONG" else -1
+                floating += (px - entry) * qty * side
+            total = realized + floating
 
-            # 写入运行状态快照（界面状态显示与心跳检测）——放在扫描之前，扫描耗时中心跳保持新鲜
-            paused = pause_reason()
-            write_status(now, last, realized, floating, total, signal_str, pos_str, paused, last_scan_str, cand_count, brk_score)
-
-            # ---- 空仓扫描（只读，暂停时也照常扫描以保持界面数据新鲜）----
-            if amt == 0 and time.time() - last_scan >= SCAN_INTERVAL:
+            # ============ 三、持仓数 < 目标 时：扫描并补仓 ============
+            if len(positions) < TARGET_POSITIONS and time.time() - last_scan >= SCAN_INTERVAL:
                 last_scan = time.time()
                 last_scan_str = now
                 cands = scan_top()
                 cand_count = len(cands)
-                recs = [{"rank": i, "symbol": c["symbol"], "direction": c["direction"],
-                         "r2": c["r2"], "slope_pct": c["slope_pct"], "price": c["price"],
-                         "vol": c["vol"], "score": c["score"]} for i, c in enumerate(cands, 1)]
+                # 写入扫描结果（界面展示）：单 30m 窗口评分 + 日内振幅
+                recs = [{"rank": i, "symbol": c["symbol"], "direction": c.get("direction", 1),
+                         "r2": c.get("r2", 0), "slope_pct": c.get("slope_pct", 0), "price": c.get("price", 0),
+                         "vol": c.get("vol", 0), "ampl": c.get("ampl", 0), "score": c.get("score", 0)}
+                        for i, c in enumerate(cands, 1)]
                 with open(SCAN_RESULTS_FILE, "w", encoding="utf-8") as f:
                     json.dump({"time": now, "hours": WINDOW_HOURS, "candidates": recs}, f, ensure_ascii=False, indent=2)
+                # 达标队列（评分>ENTRY_SCORE）用于补仓与变化判定
+                cur_queue = [c["symbol"] for c in cands if c.get("score", 0) > ENTRY_SCORE]
+                chg = queue_change_pct(last_queue, cur_queue)
+                if cur_queue:
+                    save_queue_snapshot(cur_queue)
+                    last_queue = cur_queue
                 if cands:
-                    c = cands[0]
-                    print(f"[{now}] [扫描] 发现 {len(cands)} 个干净趋势目标，Top1 {c['symbol']}：R² {c['r2']:.2f} | 斜率 {c['slope_pct']*100:+.4f}%/根 | {('上升趋势（做多）' if c['slope_pct'] > 0 else '下降趋势（做空）')} | 价格 {c['price']:.6f} | 量 {c['vol']/1000000:.1f}M | 请在可视化界面选择开仓", flush=True)
+                    print(f"[{now}] [扫描] 发现 {len(cands)} 个目标，达标(>800) {len(cur_queue)} 个，队列变化 {chg*100:.0f}%", flush=True)
                 else:
-                    print(f"[{now}] [扫描] 当前市场无干净趋势目标，继续空仓等待（界面显示 0 个候选）", flush=True)
+                    print(f"[{now}] [扫描] 当前市场无达标目标，空仓等待", flush=True)
+                # 队列变化达阈值或无持仓时补仓
+                if len(positions) < TARGET_POSITIONS and (chg >= QUEUE_CHANGE_PCT or len(positions) == 0):
+                    replenish_positions(now, cands, positions, trades)
 
-            # 手动暂停保护：检测交易所仓位被外部改动（手动平仓/手动开仓/手动翻向），自动暂停不自动交易
-            if paused:
-                print(f"[{now}] [暂停中] {paused}，等待恢复（删除 {os.path.basename(PAUSE_FILE)} 或在界面点击恢复交易）", flush=True)
-                time.sleep(POLL_SECONDS)
-                continue
-            manual = None
-            if open_position and amt == 0:
-                manual = "手动平仓"
-            elif open_position and ((open_position["side"] == "LONG" and amt < 0) or (open_position["side"] == "SHORT" and amt > 0)):
-                manual = "手动反向开仓"
-            elif not open_position and amt != 0:
-                manual = "手动开仓"
-            if manual:
-                print(f"[{now}] [警告] 检测到{manual}（本地记录 {'多' if open_position and open_position['side'] == 'LONG' else '空'}，实际仓位 {amt}），自动暂停交易保护，不会动你的仓位", flush=True)
-                open_position = None
-                save_trades(trades, open_position)
-                pause_bot(manual)
-                time.sleep(POLL_SECONDS)
-                continue
-
-            # 止盈/止损检查：触发则平仓锁利/止损，并标记离场方向（同方向暂不重进）
-            hit = check_tp_sl(amt, entry, last)
-            if hit:
-                pos_side = "LONG" if amt > 0 else "SHORT"
-                fq, fp, ot, fee = smart_close(abs(amt), pos_side)
-                pnl = (fp - entry) * fq * (1 if pos_side == "LONG" else -1)
-                trades.append({
-                    "buy_time": rec_pos["time"] if rec_pos else now,
-                    "buy_price": rec_pos["price"] if rec_pos else 0,
-                    "buy_qty": abs(amt),
-                    "buy_cost": rec_pos["cost"] if rec_pos else fq * fp,
-                    "sell_time": now,
-                    "sell_price": fp,
-                    "sell_qty": fq,
-                    "sell_revenue": fq * fp,
-                    "pnl": pnl,
-                    "side": pos_side,
-                    "entry_type": rec_pos.get("order_type", "—") if rec_pos else "—",
-                    "exit_type": ot,
-                    "entry_fee": rec_pos.get("entry_fee", 0) if rec_pos else 0,
-                    "exit_fee": fee,
-                    "reason": "止盈" if hit == "TP" else "止损",
-                })
-                print(f"[{now}] >>> {('止盈' if hit == 'TP' else '止损')} {fq} {BASE_ASSET} @ {fp:.4f}（{ot}），盈亏 {pnl:+.2f} USDT（手续费 {fee:.4f}U）", flush=True)
-                open_position = None
-                save_trades(trades, open_position)
-                risk_exit_side = pos_side
-                amt = 0
-
-            # ---- 动态回撤止损/止盈：价格从入场以来最佳价回撤达 10% 即平仓（锁利或止损）----
-            if amt != 0:
-                trail_hit, new_best, dd = check_trailing(rec_pos, amt, last)
-                if rec_pos:
-                    cur_best = float(rec_pos.get("best_price") or rec_pos["price"])
-                    if abs(cur_best - new_best) > 1e-12:
-                        rec_pos["best_price"] = new_best
-                        save_trades(trades, open_position)  # 持久化最佳价，重启后继续跟踪
-                    if trail_hit:
-                        pos_side = "LONG" if amt > 0 else "SHORT"
-                        fq, fp, otype, fee = smart_close(abs(amt), pos_side)
-                        trades.append(make_close_record(rec_pos, fq, fp, otype, fee, pos_side, now, "动态回撤"))
-                        print(f"[{now}] >>> 动态回撤平{('多' if pos_side == 'LONG' else '空')} @ {fp:.4f}（{otype}），回撤 {dd*100:.2f}%，盈亏 {trades[-1]['pnl']:+.2f} USDT（手续费 {fee:.4f}U）", flush=True)
-                        open_position = None
-                        save_trades(trades, open_position)
-                        risk_exit_side = pos_side
-                        amt = 0
-
-            # ---- 斜率趋势策略进出场 ----
-            # 保持条件：R² 与斜率未跌破离场阈值时继续持有
-            keep_pos = (r2 >= R2_EXIT) and (abs(slope_pct) >= slope_exit())
-            if amt != 0:
-                pos_side = "LONG" if amt > 0 else "SHORT"
-                if not keep_pos:
-                    # 趋势破坏 -> 空仓
-                    fq, fp, otype, fee = smart_close(abs(amt), pos_side)
-                    trades.append(make_close_record(rec_pos, fq, fp, otype, fee, pos_side, now, "趋势破坏"))
-                    print(f"[{now}] >>> 趋势破坏平{('多' if pos_side == 'LONG' else '空')} @ {fp:.4f}（{otype}），盈亏 {trades[-1]['pnl']:+.2f} USDT（手续费 {fee:.4f}U）", flush=True)
-                    open_position = None
-                    save_trades(trades, open_position)
-                    amt = 0
-                elif sig_dir != 0 and ((pos_side == "LONG" and sig_dir < 0) or (pos_side == "SHORT" and sig_dir > 0)):
-                    # 趋势仍干净但斜率反向 -> 直接翻转
-                    fq, fp, otype, fee = smart_close(abs(amt), pos_side)
-                    trades.append(make_close_record(rec_pos, fq, fp, otype, fee, pos_side, now, "趋势翻转"))
-                    print(f"[{now}] >>> 趋势翻转平{('多' if pos_side == 'LONG' else '空')} @ {fp:.4f}（{otype}），盈亏 {trades[-1]['pnl']:+.2f} USDT（手续费 {fee:.4f}U）", flush=True)
-                    open_position = None
-                    save_trades(trades, open_position)
-                    amt = 0
-            # ---- 空仓：处理可视化界面的开仓请求（open_request.json），清仓始终自动 ----
-            if amt == 0 and os.path.exists(OPEN_REQUEST_FILE):
-                try:
-                    with open(OPEN_REQUEST_FILE, "r", encoding="utf-8") as f:
-                        req = json.load(f)
-                except Exception:
-                    req = None
-                if req and req.get("symbol"):
-                    sym = str(req["symbol"]).upper().strip()
-                    os.remove(OPEN_REQUEST_FILE)  # 先删请求，避免重复处理
-                    if not sym.endswith("USDT"):
-                        LAST_OPEN_NOTE.update({"text": f"请求币种 {sym} 格式非法（需以 USDT 结尾），已忽略", "time": now})
-                        print(f"[{now}] [开仓] 请求币种 {sym} 格式非法（需以 USDT 结尾），已忽略", flush=True)
-                        continue
-                    ok, slope2, r22, price2 = verify_symbol(sym)
-                    if not ok:
-                        LAST_OPEN_NOTE.update({"text": f"请求币种 {sym} 复核不通过：趋势已不干净（R² {r22:.2f} < 进场阈值 {R2_ENTER}），放弃开仓", "time": now})
-                        print(f"[{now}] [开仓] 请求币种 {sym} 趋势已不干净（R² {r22:.2f}），放弃开仓，继续扫描", flush=True)
-                        continue
-                    side = "LONG" if slope2 > 0 else "SHORT"
-                    if risk_exit_side == side:
-                        LAST_OPEN_NOTE.update({"text": f"{sym} 当前方向与止盈/止损离场方向相同，暂不开仓，等待方向翻向对面", "time": now})
-                        print(f"[{now}] [开仓] {sym} 当前{('上升（做多）' if slope2 > 0 else '下降（做空）')}方向与止盈/止损离场方向相同，暂不开仓，等待方向翻向对面", flush=True)
-                        continue
-                    # ---- 资金费率监控：逆费率方向开仓且费率超阈值时拒绝（顺费率方向可收资金费，放行）----
-                    fund_rate = get_funding_rate(sym)
-                    if fund_rate is not None and abs(fund_rate) > FUNDING_RATE_LIMIT:
-                        pay = (side == "LONG" and fund_rate > 0) or (side == "SHORT" and fund_rate < 0)
-                        if pay:
-                            LAST_OPEN_NOTE.update({"text": f"{sym} 资金费率 {fund_rate*100:.3f}%/8h，做{('多' if side == 'LONG' else '空')}需付高额资金费，拒绝开仓（阈值 ±{FUNDING_RATE_LIMIT*100:.1f}%）", "time": now})
-                            print(f"[{now}] [拦截] {sym} 资金费率 {fund_rate*100:.3f}%/8h，做{('多' if side == 'LONG' else '空')}需付高额资金费（每 8 小时约扣名义×{fund_rate*100:.2f}%），拒绝开仓。阈值 ±{FUNDING_RATE_LIMIT*100:.1f}%；如改做{('空' if side == 'LONG' else '多')}可收取资金费", flush=True)
-                            continue
-                        print(f"[{now}] [提示] {sym} 资金费率 {fund_rate*100:.3f}%/8h，顺费率方向开{('多' if side == 'LONG' else '空')}可收资金费，继续开仓", flush=True)
-                    SYMBOL = sym
-                    BASE_ASSET = SYMBOL.replace("USDT", "")
-                    set_leverage()
-                    qty_to_trade, balance = calc_full_qty(price2)
-                    if qty_to_trade <= 0 or qty_to_trade * price2 / LEVERAGE > balance:
-                        LAST_OPEN_NOTE.update({"text": f"{sym} 余额不足无法开{('多' if side == 'LONG' else '空')}（可用 {balance:.2f} USDT）", "time": now})
-                        print(f"[{now}] [警告] 余额不足无法开{('多' if side == 'LONG' else '空')}（可用 {balance:.2f} USDT），跳过本轮", flush=True)
-                        continue
-                    fill_qty, fill_px, otype, entry_fee = smart_open(side, qty_to_trade)
-                    risk_exit_side = None
-                    open_position = {"time": now, "side": side, "qty": fill_qty, "price": fill_px, "cost": fill_qty * fill_px, "order_type": otype, "entry_fee": entry_fee, "best_price": fill_px}
-                    save_trades(trades, open_position)
-                    if os.path.exists(SCAN_RESULTS_FILE):
-                        os.remove(SCAN_RESULTS_FILE)
-                    LAST_OPEN_NOTE.update({"text": f"已开{('多' if side == 'LONG' else '空')} {sym} {fill_qty} {BASE_ASSET} @ {fill_px:.6f}（名义 {fill_qty*fill_px:.2f} USDT）", "time": now})
-                    print(f"[{now}] >>> 界面确认开{('多' if side == 'LONG' else '空')} {sym} {fill_qty} {BASE_ASSET} @ {fill_px:.6f}，名义 {fill_qty*fill_px:.2f} USDT（全仓·{otype}）", flush=True)
+            # ============ 四、平均评分回撤进度 + 状态快照 ============
+            brk_scores = []
+            for sym in list(positions.keys()):
+                si = score_for(sym)
+                if not si:
+                    continue
+                peak = positions[sym].get("peak_score") or si["score"]
+                brk_scores.append(trend_break_progress(si["score"], peak))
+            avg_break = int(sum(brk_scores) / len(brk_scores)) if brk_scores else 0
+            sig_str = f"{len(positions)}仓" if positions else "空仓"
+            print(f"[{now}] 持仓 {len(positions)}/{TARGET_POSITIONS} | 已实现 {realized:.2f}U | 浮动 {floating:+.2f}U | 总盈亏 {total:+.2f}U | 评分回撤均值 {avg_break}分", flush=True)
+            write_status(now, realized, floating, total, sig_str, positions, last_scan_str, cand_count, avg_break)
+            append_pnl_history(now, 0.0, realized, floating, total, sig_str, sig_str)
         except Exception as e:
             print(f"[{now}] 出错: {e}")
         time.sleep(POLL_SECONDS)
 
-
 if __name__ == "__main__":
     if "--check" in sys.argv:
         slope_pct, r2, last = check_signal()
-        print(f"{SYMBOL} 最新价 {last:.4f} | 斜率 {slope_pct*100:+.4f}%/根 | R² {r2:.2f}（进场≥{R2_ENTER}，离场<{R2_EXIT}）")
+        score = trend_score(r2, slope_pct)
+        print(f"{SYMBOL} 最新价 {last:.4f} | 斜率 {slope_pct*100:+.4f}%/根 | R² {r2:.2f}（进场≥{R2_ENTER}）| 评分 {score:.0f}（卖出=持仓中较峰值下降{SCORE_DROP_PCT*100:.0f}%）")
         if r2 >= R2_ENTER and abs(slope_pct) >= slope_min():
             print("当前信号:", "上升趋势（应开多）" if slope_pct > 0 else "下降趋势（应开空）")
         else:
