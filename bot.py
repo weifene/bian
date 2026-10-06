@@ -42,19 +42,17 @@ if len(lines) < 2:
 API_KEY = lines[0]
 API_SECRET = lines[1]
 SYMBOL = "CARVUSDT"                                # 交易对（U 本位合约）
-INTERVAL = Client.KLINE_INTERVAL_15MINUTE           # 15 分钟 K 线（趋势窗口由 WINDOW_HOURS 决定：1 小时 = 4 根）
+INTERVAL = Client.KLINE_INTERVAL_15MINUTE           # 15 分钟 K 线（趋势窗口固定为 30 分钟 = 1m×30 根）
 FAST_PERIOD = 5                                     # 快线周期
 SLOW_PERIOD = 20                                    # 慢线周期
-WINDOW_OPTIONS = (1, 3, 6, 12)                     # 可选趋势窗口（小时）：界面可选择最近 1/3/6/12 小时
-WINDOW_HOURS = 12                                   # 当前趋势窗口（小时）：扫描、开仓复核、持仓信号统一使用，默认最近 12 小时
-SCAN_WINDOW_FILE = r"d:\bian\scan_window.json"     # 可视化界面选择的窗口写入此文件，机器人每轮读取并生效
+WINDOW_HOURS = 0.5                                  # 趋势窗口小时数（固定 30 分钟 = 0.5h），仅用于界面展示
 R2_ENTER = 0.75                                     # 进场 R² 阈值：趋势干净度达标才进场（0~1，越高越严）
 R2_EXIT = 0.40                                      # 离场 R² 阈值：跌破则认为趋势破坏 -> 空仓
 SLOPE_MIN_PCT = 0.0008                              # 进场最小斜率（每根K线价格变动比例）：低于此不进场
 SLOPE_EXIT_MIN = 0.0002                             # 离场最小斜率：斜率低于此视为走平 -> 空仓
 MIN_VOLUME = 2000000                                 # 选币扫描：24h 成交量下限（USDT），过滤空气币
 SCAN_INTERVAL = 15                                    # 只扫 top20 高波动币，扫描间隔（秒）：每 15 秒扫一轮
-SCAN_TOP_N = 20                                       # 扫描的高波动币数量：按日内振幅排序取前 20 只
+SCAN_TOP_N = 10                                       # 扫描的高波动币数量：按日内振幅排序取前 10 只
 SCAN_RESULTS_FILE = r"d:\bian\scan_results.json"     # 扫描结果（Top 20）写入此文件，供可视化界面读取展示
 SCAN_PROGRESS_FILE = r"d:\bian\scan_progress.json"  # 扫描进度实时写入此文件（当前/总数/已发现/下次时间），供界面显示刷新进度
 QUEUE_SNAPSHOT_FILE = r"d:\bian\scan_queue_snapshot.json"  # 上次扫描候选队列快照（评分降序 symbol 列表），用于判断队列变化 ≥10% 触发补仓
@@ -63,14 +61,14 @@ OPEN_REQUEST_FILE = r"d:\bian\open_request.json"     # 可视化界面选定的�
 LAST_OPEN_NOTE = {"text": "", "time": ""}             # 最近一次界面开仓请求的处理结果（拒绝原因/成功信息），写入状态快照供界面显示
 STOP_FILE = r"d:\bian\stop_request.flag"             # 可视化界面"停止程序"按钮：存在此文件机器人优雅退出
 STATUS_FILE = r"d:\bian\bot_status.json"             # 每轮轮询写入运行状态快照（界面状态显示与心跳检测）
-LEVERAGE = 3                                        # 杠杆倍数（3x：每仓 6U 保证金 → 名义金额 ≈ 18U）
-TARGET_POSITIONS = 5                                # 自动组合持仓目标数：最多同时持有 5 个品种
-POS_MARGIN_USDT = 6.0                               # 每个品种下单保证金（USDT）固定 6U，×杠杆 = 名义金额
-ENTRY_SCORE = 800                                   # 自动开仓评分门槛：评分 > 800 才考虑补仓
+LEVERAGE = 3                                        # 杠杆倍数（3x：每仓 2U 保证金 → 名义金额 ≈ 6U）
+TARGET_POSITIONS = 999                                # 持仓数量上限：999 ≈ 不限制（2U/仓，余额决定实际数量）
+POS_MARGIN_USDT = 2.0                               # 每个品种下单保证金（USDT）固定 2U，×杠杆 = 名义金额
+ENTRY_SCORE = 1100                                  # 自动开仓评分门槛：评分 > 1100 才考虑补仓（回测：收紧可大幅减少无效交易）
 QUEUE_CHANGE_PCT = 0.10                             # 触发补仓的扫描队列变化阈值：本次候选队列较上次变化 ≥10% 才补仓
-TRAIL_PCT = 0.10                                    # 动态回撤止损/止盈：价格从入场以来最佳价（多=最高/空=最低）回撤达到 10% 即平仓（锁利或止损）
-SCORE_DROP_PCT = 0.40                               # 评分制卖出：持仓期间跟踪最高评分（R²×1000+|斜率|×100000），评分较峰值下降 40% 即平仓
-                                                    #   （从 25% 放宽到 40%，降低对实时评分抖动敏感度，减少"刚开就平"的手续费损耗；峰值用开仓当时实时评分口径）
+SCORE_DROP_PCT = 0.20                               # 评分制卖出：持仓期间跟踪最高评分（R²×1000+|斜率|×100000），评分较峰值下降 20% 即平仓
+                                                    #   （回测 A 显示 20% 为最优；点评分下降 20% 即回撤平仓，让趋势跑完）
+                                                    #   （评分回撤是平仓的唯一条件——不设动态回撤止损/止盈、固定止盈止损，让趋势跑完）
 FUNDING_RATE_LIMIT = 0.005                          # 资金费率监控阈值：|资金费率| 超过 0.1%（每8小时）且逆费率方向开仓时拒绝。
                                                     #   资金费率正=多头付费给空头，负=空头付费给多头；顺费率方向开仓可收取资金费，不拦截
 LIMIT_TIMEOUT = 4                                   # 限价单等待秒数：先挂 maker 价省手续费，超时未完全成交自动转市价兜底
@@ -205,7 +203,7 @@ def market_order(qty, side, symbol=None):
 
 
 def order_market_position(symbol, side, margin_usdt=POS_MARGIN_USDT):
-    """按固定保证金（默认 6U）× 杠杆，对指定 symbol **市价**开仓。
+    """按固定保证金（默认 2U）× 杠杆，对指定 symbol **市价**开仓。
     side: 'LONG'/'SHORT'。返回 (成交数量, 成交均价, 名义金额, 手续费估算)。
     symbol 需为某 USDT 永续。"""
     notional = margin_usdt * LEVERAGE
@@ -362,15 +360,15 @@ def _write_scan_progress(phase, current=0, total=0, found=0, next_ts=0):
 
 
 def ensure_top20_pool():
-    """每日只更新一次高波动 top20 候选池：按日内振幅（24h 高点-低点/现价）排序取前 SCAN_TOP_N 只。
-    当天已选过则直接复用池文件（不重复全市场拉取），次日自动重选。
-    返回当且候选池 symbol 列表；失败返回 []。"""
-    today = datetime.date.today().isoformat()
-    # 已是今天选过的池，直接复用
+    """每 4 小时（0/4/8/12/16/20 点）更新一次高波动候选池：按日内振幅（24h 高点-低点/现价）排序取前 SCAN_TOP_N 只。
+    当前 4 小时段内已选过则直接复用池文件（不重复全市场拉取），到下一个整 4 点自动重选。
+    返回候选池 symbol 列表（已持仓会由调用方并入，保证持仓币种也参与评分）；失败返回 []。"""
+    bucket = int(time.time() // (4 * 3600))          # 每 4 小时一个桶：0点/4点/8点...
+    # 已是当前 4 小时段选过的池，直接复用
     try:
         with open(TOP20_POOL_FILE, "r", encoding="utf-8") as f:
             d = json.load(f)
-        if d.get("date") == today and d.get("symbols"):
+        if d.get("bucket") == bucket and d.get("symbols"):
             return d["symbols"]
     except Exception:
         pass
@@ -398,20 +396,28 @@ def ensure_top20_pool():
     if syms:
         try:
             with open(TOP20_POOL_FILE, "w", encoding="utf-8") as f:
-                json.dump({"date": today, "symbols": syms, "picked": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
+                json.dump({"bucket": bucket, "symbols": syms, "picked": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
                           f, ensure_ascii=False, indent=2)
-            print(f"[池] 今日高波动 top{len(syms)} 候选池已更新：{' '.join(s.replace('USDT','') for s in syms)}", flush=True)
+            print(f"[池] 本4小时段高波动 top{len(syms)} 候选池已更新：{' '.join(s.replace('USDT','') for s in syms)}", flush=True)
         except Exception:
             pass
     return syms
 
 
 def scan_top(limit=None):
-    """对当日高波动 top20 候选池（ensure_top20_pool，每天一次）逐一做单一 30m 窗口评分。
+    """对当前 4 小时段高波动候选池（ensure_top20_pool）逐一做单一 30m 窗口评分。
+    已持仓的币始终并入池中（即使不在高波动前10），保证持仓币种持续被管理。
     入选条件：30m 窗口满足进场要求（R²>=R2_ENTER 且 |斜率|>=该周期折算阈值）。
     返回 list[dict]，含 score/r2/slope/direction/ampl 等字段，评分降序。界面按评分排序展示。
     扫描过程中实时写入 SCAN_PROGRESS_FILE，供界面显示进度。"""
     pool = ensure_top20_pool()
+    # 已持仓的币也算高波动币：并入池中，去重保留顺序
+    try:
+        held = [s for s in get_all_positions().keys() if s.endswith("USDT")]
+    except Exception:
+        held = []
+    if held:
+        pool = list(dict.fromkeys(list(pool) + held))
     if not pool:
         _write_scan_progress("error")
         return []
@@ -456,9 +462,12 @@ def scan_top(limit=None):
     return result
 
 
-def write_status(now, realized, floating, total, signal_str, positions, last_scan_str, cand_count, avg_break_score):
+def write_status(now, realized, floating, total, signal_str, positions, last_scan_str, cand_count, avg_break_score, brk_map=None):
     """每轮轮询写入运行状态快照，供可视化界面显示状态与心跳检测。
-    positions: dict{symbol: pos}，avg_break_score: 各持仓评分回撤进度均值（用于状态卡片展示）。"""
+    positions: dict{symbol: pos}，avg_break_score: 各持仓评分回撤进度均值（用于状态卡片展示），
+    brk_map: dict{symbol: 回撤进度0~100}，逐个写入持仓，界面逐仓展示评分回撤进度。"""
+    if brk_map:
+        positions = {s: dict(p, break_score=brk_map.get(s, 0)) for s, p in positions.items()}
     st_data = {
         "time": now,
         "symbol": SYMBOL,
@@ -468,7 +477,7 @@ def write_status(now, realized, floating, total, signal_str, positions, last_sca
         "total": total,
         "signal": signal_str,
         "position": "\n".join(f"{s}:{p.get('side','?')}" for s, p in positions.items()) or "空仓",
-        "positions": positions,               # 多持仓 dict，界面读取展示表格
+        "positions": positions,               # 多持仓 dict，界面读取展示表格（含 break_score 逐仓回撤进度）
         "last_scan": last_scan_str,
         "candidate_count": cand_count,
         "break_score": avg_break_score,       # 各持仓评分回撤进度均值 0~100
@@ -628,13 +637,13 @@ def queue_change_pct(last_queue, cur_queue):
 
 
 def get_max_margin():
-    """估算单仓 6U 保证金 × 杠杆下的名义金额（用于补仓判断）"""
+    """估算单仓 2U 保证金 × 杠杆下的名义金额（用于补仓判断）"""
     return POS_MARGIN_USDT * LEVERAGE
 
 
 def replenish_positions(now, cands, positions, trades):
-    """自动补仓：当前持仓数 < 目标数时，从达标队列（评分>ENTRY_SCORE、未持仓、未反向）按评分降序
-    逐个市价开 6U 仓，直到满仓或资金不足。返回新持仓数量或 None 表示资金不足需停止。"""
+    """自动补仓：从达标队列（评分>ENTRY_SCORE、未持仓、未反向）按评分降序逐个市价开 2U 仓，
+    直至资金不足或候选耗尽（不限制持仓币种个数）。返回新持仓数量或 None 表示资金不足需停止。"""
     held = set(positions.keys())
     # 交易所当前已有但本地未记录的仓位也视为已持有（避免重复开）
     for sym, p in get_all_positions().items():
@@ -645,12 +654,10 @@ def replenish_positions(now, cands, positions, trades):
                   and c.get("score", 0) > ENTRY_SCORE]
     candidates.sort(key=lambda c: -c["score"])
     for c in candidates:
-        if len(positions) >= TARGET_POSITIONS:
-            break
         sym = c["symbol"]
         side = "LONG" if c.get("direction", 1) > 0 else "SHORT"
         balance = get_wallet_balance()
-        # 每仓保证金 6U：余额需 ≥ POS_MARGIN_USDT（留手续费缓冲），否则资金不足停止
+        # 每仓保证金 2U：余额需 ≥ POS_MARGIN_USDT（留手续费缓冲），否则资金不足停止
         if balance < POS_MARGIN_USDT * 1.1:
             print(f"[{now}] [补仓] 余额 {balance:.2f}U 不足以再开一仓（需 ≥{POS_MARGIN_USDT*1.1:.1f}U），停止补仓", flush=True)
             return None
@@ -680,14 +687,14 @@ def replenish_positions(now, cands, positions, trades):
 
 
 def main():
-    global SYMBOL, BASE_ASSET, WINDOW_HOURS  # 趋势窗口由界面选择动态生效；SYMBOL 为界面展示主标的
+    global SYMBOL, BASE_ASSET  # SYMBOL 为界面展示主标的
     trades, positions, saved_symbol = load_trades()
     if saved_symbol and saved_symbol.endswith("USDT"):
         SYMBOL = saved_symbol  # 恢复上次主标的（用于界面展示与持仓恢复定位）
         BASE_ASSET = SYMBOL.replace("USDT", "")
         print(f"已恢复主标的：{SYMBOL} | 当前持仓 {len(positions)} 个")
     ensure_one_way_mode()
-    print(f"机器人启动 | 多品种自动组合持仓策略 | 目标持仓 {TARGET_POSITIONS} 个 | 每仓保证金 {POS_MARGIN_USDT:.0f}U × {LEVERAGE}x（名义≈{POS_MARGIN_USDT*LEVERAGE:.0f}U）| 自动开仓评分>{ENTRY_SCORE} | 队列变化≥{QUEUE_CHANGE_PCT*100:.0f}% 触发补仓 | 卖出=评分较峰值下降 {SCORE_DROP_PCT*100:.0f}%（市价平仓）| 市价下单 | 全仓共享余额 | 界面停止：创建 {os.path.basename(STOP_FILE)}")
+    print(f"机器人启动 | 多品种自动组合持仓策略 | 持仓数量不限 | 每仓保证金 {POS_MARGIN_USDT:.0f}U × {LEVERAGE}x（名义≈{POS_MARGIN_USDT*LEVERAGE:.0f}U）| 自动开仓评分>{ENTRY_SCORE} | 队列变化≥{QUEUE_CHANGE_PCT*100:.0f}% 触发补仓 | 卖出=评分较峰值下降 {SCORE_DROP_PCT*100:.0f}%（市价平仓）| 市价下单 | 全仓共享余额 | 界面停止：创建 {os.path.basename(STOP_FILE)}")
     print(f"合约钱包 USDT 余额: {get_wallet_balance():.2f} | 历史已平仓 {len(trades)} 笔")
     last_scan = 0  # 上次全市场扫描时间（0 = 启动后立即首次扫描）
     last_scan_str = "启动后未扫描"  # 上次扫描时间字符串（写入状态文件供界面显示）
@@ -704,17 +711,6 @@ def main():
                 except Exception:
                     pass
                 sys.exit(0)
-            # 读取界面选择的趋势窗口（scan_window.json），本轮回合开始前生效
-            if os.path.exists(SCAN_WINDOW_FILE):
-                try:
-                    with open(SCAN_WINDOW_FILE, "r", encoding="utf-8") as f:
-                        wh = json.load(f).get("hours")
-                    if wh in WINDOW_OPTIONS and wh != WINDOW_HOURS:
-                        WINDOW_HOURS = wh
-                        print(f"[{now}] 趋势窗口已切换为最近 {WINDOW_HOURS} 小时", flush=True)
-                except Exception:
-                    pass
-
             # ============ 一、管理各持仓：评分回撤达 SCORE_DROP_PCT 即市价平仓 ============
             act_positions = get_all_positions()   # 交易所实际持仓
             prices = {}                            # 各持仓最新价缓存
@@ -759,8 +755,8 @@ def main():
                 floating += (px - entry) * qty * side
             total = realized + floating
 
-            # ============ 三、持仓数 < 目标 时：扫描并补仓 ============
-            if len(positions) < TARGET_POSITIONS and time.time() - last_scan >= SCAN_INTERVAL:
+            # ============ 三、按周期扫描并补仓（不限制持仓币种个数） ============
+            if time.time() - last_scan >= SCAN_INTERVAL:
                 last_scan = time.time()
                 last_scan_str = now
                 cands = scan_top()
@@ -779,25 +775,25 @@ def main():
                     save_queue_snapshot(cur_queue)
                     last_queue = cur_queue
                 if cands:
-                    print(f"[{now}] [扫描] 发现 {len(cands)} 个目标，达标(>800) {len(cur_queue)} 个，队列变化 {chg*100:.0f}%", flush=True)
+                    print(f"[{now}] [扫描] 发现 {len(cands)} 个目标，达标(>1100) {len(cur_queue)} 个，队列变化 {chg*100:.0f}%", flush=True)
                 else:
                     print(f"[{now}] [扫描] 当前市场无达标目标，空仓等待", flush=True)
-                # 队列变化达阈值或无持仓时补仓
-                if len(positions) < TARGET_POSITIONS and (chg >= QUEUE_CHANGE_PCT or len(positions) == 0):
+                # 队列变化达阈值或无持仓时补仓（2U/仓，直至余额不足或候选耗尽，不限数量）
+                if chg >= QUEUE_CHANGE_PCT or len(positions) == 0:
                     replenish_positions(now, cands, positions, trades)
 
             # ============ 四、平均评分回撤进度 + 状态快照 ============
-            brk_scores = []
+            brk_map = {}
             for sym in list(positions.keys()):
                 si = score_for(sym)
                 if not si:
                     continue
                 peak = positions[sym].get("peak_score") or si["score"]
-                brk_scores.append(trend_break_progress(si["score"], peak))
-            avg_break = int(sum(brk_scores) / len(brk_scores)) if brk_scores else 0
+                brk_map[sym] = trend_break_progress(si["score"], peak)
+            avg_break = int(sum(brk_map.values()) / len(brk_map)) if brk_map else 0
             sig_str = f"{len(positions)}仓" if positions else "空仓"
-            print(f"[{now}] 持仓 {len(positions)}/{TARGET_POSITIONS} | 已实现 {realized:.2f}U | 浮动 {floating:+.2f}U | 总盈亏 {total:+.2f}U | 评分回撤均值 {avg_break}分", flush=True)
-            write_status(now, realized, floating, total, sig_str, positions, last_scan_str, cand_count, avg_break)
+            print(f"[{now}] 持仓 {len(positions)} | 已实现 {realized:.2f}U | 浮动 {floating:+.2f}U | 总盈亏 {total:+.2f}U | 评分回撤均值 {avg_break}分", flush=True)
+            write_status(now, realized, floating, total, sig_str, positions, last_scan_str, cand_count, avg_break, brk_map)
             append_pnl_history(now, 0.0, realized, floating, total, sig_str, sig_str)
         except Exception as e:
             print(f"[{now}] 出错: {e}")
