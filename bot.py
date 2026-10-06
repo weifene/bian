@@ -272,13 +272,15 @@ def trend_1h(symbol):
     return r2, slope, cl[-1]
 
 
-def entry_ok(symbol):
-    """1h 趋势成立（仅多）：R²≥R2_ENTRY 且 |斜率|≥SL_H 且 slope>0"""
+def trend_status(symbol):
+    """返回 (是否处于趋势, 1h斜率)。"是否处于趋势"= R²≥R2_ENTRY 且 |斜率|≥SL_H，**不分方向**
+    （对齐回测 sig）；做多方向在开仓时单独用 slope>0 判断。
+    确认计数用"趋势强度"连续累计、开仓时才要求方向，以忠实复刻回测 hot+dir 逻辑。"""
     try:
         r2, slope, _ = trend_1h(symbol)
     except Exception:
-        return False
-    return r2 >= R2_ENTRY and abs(slope) >= SL_H and slope > 0
+        return False, 0.0
+    return (r2 >= R2_ENTRY and abs(slope) >= SL_H), slope
 
 
 # ---------------- 趋势跟随策略：选币池 ---------------
@@ -333,11 +335,12 @@ def try_open_entries(now, positions, trades, pool, confirm):
         if bal < POS_MARGIN_USDT * 1.1:
             print(f"[{now}] 余额 {bal:.2f}U 不足开新仓（需 ≥{POS_MARGIN_USDT*1.1:.1f}U），停止开仓", flush=True)
             return
-        if not entry_ok(sym):
+        active, slope = trend_status(sym)
+        if not active:                 # 趋势强度不达标：确认计数清零（对齐回测 sig）
             confirm[sym] = 0
             continue
-        confirm[sym] = confirm.get(sym, 0) + 1
-        if confirm[sym] < CONF:
+        confirm[sym] = confirm.get(sym, 0) + 1   # 趋势强度连续累计（不分方向，对齐回测 hot）
+        if confirm[sym] < CONF or slope <= 0:    # 未确认满4根 或 当前非上升趋势(仅多) 则不开
             continue
         # 资金费率风控：开多由多头付费；正费率过高则跳过（避免缴纳高额资金费）
         rate = get_funding_rate(sym)
