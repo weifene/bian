@@ -40,6 +40,7 @@ OPEN_REQUEST_FILE = os.path.join(BASE_DIR, "open_request.json")
 STOP_FILE = os.path.join(BASE_DIR, "stop_request.flag")
 STATUS_FILE = os.path.join(BASE_DIR, "bot_status.json")
 SCAN_WINDOW_FILE = os.path.join(BASE_DIR, "scan_window.json")
+VOL_POOL_FILE = os.path.join(BASE_DIR, "vol_pool.json")
 BOT_PY = os.path.join(BASE_DIR, "bot.py")
 
 # 成交类型中文化（bot.py 写入的 maker/taker/mixed）
@@ -150,8 +151,8 @@ STATUS_REFRESH_SEC = 1
 def status_section():
     """机器人状态卡片 + 程序控制（局部自动刷新）"""
     st.title("🤖 智能操作台")
-    st.caption("机器人自动多品种组合持仓：不停扫描，评分>1100 且候选队列较上次变化≥10% 时自动市价补仓（每仓 2U 保证金 × 3x），"
-               "持仓数量不限，不同品种不重复下单，余额不足自动停止；卖出 = 评分较持仓峰值下降 20%（市价平仓，始终自动执行）。")
+    st.caption("v4 趋势跟随·仅做多：成交量前 30 永续池，1h 回归 R²≥0.70 且 |斜率|≥0.00015，15m 连续确认 4 根后自动市价开多"
+               "（每仓 2U×3x=6U 名义，最多 8 仓）；吊灯止损 K=6×ATR(15m,14) 自动平仓（reason=吊灯止损）。")
 
     status, alive = load_status()
 
@@ -168,40 +169,28 @@ def status_section():
     c6.metric("总盈亏 (USDT)", f"{status.get('total', 0):+.2f}" if alive else "—")
     if alive:
         st.caption(f"最新心跳：{status.get('time', '—')} | 已实现 {status.get('realized', 0):+.2f} / 浮动 {status.get('floating', 0):+.2f} | "
-                   f"上次扫描：{status.get('last_scan', '—')}（{status.get('candidate_count', 0)} 个候选）\uFF5E"
-                   f"自动开仓：评分>1100 且队列变化≥10%")
+                   f"策略：吊灯 K6×ATR(15m,14)·仅多·确认4根")
         if positions:
             try:
                 pdl = pd.DataFrame([
-                    {"币种": s, "方向": p.get("side"), "数量": f"{p.get('qty', 0):.4f}",
-                     "开仓价": f"{p.get('price', 0):.6f}", "入仓保证金U": "6.0",
-                     "评分回撤": (f"{int(p.get('break_score', 0))} 分"
-                                 f"（距平仓 {max(0, 100 - int(p.get('break_score', 0)))} 分）"
-                                 if p.get("break_score") is not None else "—")}
+                    {"币种": s, "方向": "做多", "数量": f"{p.get('qty', 0):.4f}",
+                     "开仓价": f"{p.get('price', 0):.6f}", "名义U": f"{p.get('notional', 0):.2f}",
+                     "吊灯距离": (f"{p.get('trail_pct', 0):.0f}%" if p.get('trail_pct') is not None else "—"),
+                     "最新价": f"{p.get('last_px', 0):.6f}"}
                     for s, p in positions.items()
                 ])
                 st.markdown(f"**📦 当前持仓（{n_pos}）**")
                 st.dataframe(pdl, use_container_width=True, height=32 * (n_pos + 1))
             except Exception:
                 pass
-        if positions and any(p.get("break_score") is not None for p in positions.values()):
-            # 逐仓展示评分回撤进度（对应到各持仓）
-            brk_lines = []
+        if positions and any(p.get("trail_pct") is not None for p in positions.values()):
+            # 逐仓吊灯止损距离（对应到各持仓）
+            trail_lines = []
             for s, p in positions.items():
-                b = int(p.get("break_score", 0))
-                brk_lines.append(f"`{s}` **{b} 分**（距平仓 {max(0, 100 - b)} 分）")
-            st.markdown(f"**📉 评分回撤进度**（逐仓）：{ '　'.join(brk_lines) }")
-            st.progress(min(100, max(0, int(status.get('break_score', 0)))) / 100)
-            st.caption("进度 0 分 = 评分在峰值（趋势最干净）→ 100 分 = 评分较峰值下降 20%"
-                       "（评分 = R²×1000 + |斜率|×100000，回测最优阈值，触发自动平仓）")
-        elif status.get("break_score") is not None:
-            brk = int(status.get("break_score", 0))
-            holding = status.get("position", "") != "空仓"
-            st.markdown(f"**📉 评分回撤进度**：`{brk} 分`"
-                        f"（{'持仓中，距评分回撤平仓还有 **' + str(100 - brk) + ' 分**' if holding else '当前空仓，反映本币趋势健康度'}）")
-            st.progress(min(100, max(0, brk)) / 100)
-            st.caption("0 分 = 评分在峰值（趋势最干净）→ 100 分 = 评分较峰值下降 20%"
-                       "（评分 = R²×1000 + |斜率|×100000，回测最优阈值，触发自动平仓）")
+                tp = p.get("trail_pct")
+                trail_lines.append(f"`{s}` 距吊灯线 **{tp:.0f}%**" if tp is not None else f"`{s}` —")
+            st.markdown(f"**📉 吊灯止损距离**（逐仓）：{ '　'.join(trail_lines) }")
+            st.caption("吊灯线 = 持仓最高价 maxe − 6×ATR(15m,14)；价格距吊灯线越近越易触发，跌破即市价平仓（reason=吊灯止损）。")
         if status.get("open_note"):
             note_txt = status.get("open_note", "")
             if "已开" in note_txt:
@@ -282,43 +271,40 @@ def process_check():
 
 def scan_controls():
     """扫描区（主流程，交互控件不进 fragment，避免自动刷新卡顿/回弹）：
-    扫描表由 scan_table_fragment 局部自动刷新。"""
-    st.subheader("🔍 高波动币扫描结果（top10，单 30 分钟窗口）")
-    st.caption("每 4 小时（0/4/8/12/16/20 点）更新高波动候选池：按日内振幅排序取前 10 只永续合约（24h 成交量≥200万U），"
-               "加上已持仓币种共同进入评分；对每只做 30 分钟窗口（1 分钟 K 线 × 30 根）趋势评分；"
-               "评分 = R²×1000 + |斜率|×100000，越高趋势越干净。")
+    选币池与信号由 scan_table_fragment 局部自动刷新。"""
+    st.subheader("🔍 选币池 / 趋势信号")
+    st.caption("每 4 小时（0/4/8/12/16/20 点）按 24h 成交量更新选币池（前 30 只 USDT 永续）；"
+               "每 15 分钟对新 15m bar 评估：1h 线性回归 R²≥0.70 且 |斜率|≥0.00015 且为上升趋势，"
+               "连续 4 根确认后自动市价开多。")
 
-    # ---------- 扫描表（纯展示，fragment 自动刷新，不影响上方交互控件）----------
+    # ---------- 选币池表格（纯展示，fragment 自动刷新，不影响上方交互控件）----------
     scan_table_fragment()
 
-    st.info("🤖 自动组合持仓已启用：机器人持续扫描，评分>1100 且候选队列较上次变化≥10% 时自动市价补仓"
-            "（每仓 2U 保证金 × 3x，不重复下单），持仓数量不限，余额不足自动停止。无需手动开仓。")
+    st.info("🤖 开仓自动执行（无手动确认），每仓 2U×3x=6U 名义，同时最多 8 仓；余额不足自动停止。"
+            "吊灯止损 K=6×ATR(15m,14) 自动平仓。")
 
 
-@st.fragment(run_every=max(15, refresh_sec // 2))
+@st.fragment(run_every=refresh_sec)
 def scan_table_fragment():
-    """仅展示扫描结果表：单 30m 窗口评分 + 日内振幅列（纯数据，自动刷新）"""
-    scan = load_scan()
-    if not (scan and scan.get("candidates")):
+    """展示 v4 选币池：成交量前 30 的 USDT 永续（每 4 小时刷新），以及池内已开仓标记。"""
+    st.markdown("**🗂️ 选币池（成交量前 30 USDT 永续，每 4 小时整点刷新）**")
+    try:
+        with open(VOL_POOL_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        syms = d.get("symbols", [])
+        picked = d.get("picked", "—")
+    except Exception:
+        syms, picked = [], "—"
+    status, _ = load_status()
+    held = set((status.get("positions") or {}).keys())
+    if not syms:
+        st.caption("选币池暂无数据（机器人启动后自动生成）。")
         return
-    cands = scan["candidates"]
-    scan_time = scan.get("time", "—")
-    df = pd.DataFrame(cands)
-    if df.empty:
-        return
-    df["方向"] = df["direction"].map({1: "做多（上升）", -1: "做空（下降）"})
-    df["现价"] = df["price"].map(lambda x: f"{x:.6f}")
-    df["日内振幅"] = df["ampl"].map(lambda x: f"{x:.1f}%") if "ampl" in df.columns else "—"
-    df["24h量(M U)"] = (df["vol"] / 1e6).map(lambda x: f"{x:.1f}")
-    df["扫描时间"] = scan_time
-    df["评分30m"] = df["score"].round(1)
-    df = df.sort_values("score", ascending=False, na_position="last")
-    show = df[["rank", "symbol", "方向", "评分30m", "现价", "日内振幅", "24h量(M U)", "扫描时间"]]
-    show.columns = ["#", "币种", "方向", "评分30m", "现价", "日内振幅", "24h量(M U)", "扫描时间"]
-    st.markdown(f"共发现 **{len(cands)}** 个干净趋势目标（高波动 top10 + 已持仓中满足 30m 窗口趋势门槛），按评分降序")
-    st.dataframe(show.set_index("#"), use_container_width=True, height=32 * (len(cands) + 1))
-    st.caption(f"扫描时间：{scan_time} | 评分 = R²×1000 + |斜率|×100000（30 分钟窗口，1 分钟 × 30 根）。"
-               f"**卖出规则（评分制）**：持仓期间跟踪最高评分，评分较峰值下降 **20%** 即平仓。每 15 秒更新一次。")
+    rows = [syms[i:i + 5] for i in range(0, len(syms), 5)]
+    for row in rows:
+        st.markdown("　".join(f"`{s}` 🟢已开" if s in held else f"`{s}`" for s in row))
+    st.caption(f"更新时间：{picked} | 共 {len(syms)} 币（🟢已开 = 当前持仓计入池内）。"
+               f"每 15 分钟评估：满足 1h 趋势且连续确认 4 根即自动开多，吊灯止损平仓。")
 
 
 # ================= 账户分析 =================
