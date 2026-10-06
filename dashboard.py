@@ -86,8 +86,12 @@ def load_scan():
 
 
 def load_scan_progress():
-    """读取扫描进度快照（机器人扫描时实时写入）"""
+    """读取扫描进度快照（机器人扫描时实时写入）。
+    若文件太旧（超过 90 秒未更新），视为已无实时进度，返回 None，
+    避免展示过期/误导性的“候选择 / 下一轮倒计时”。"""
     if not os.path.exists(SCAN_PROGRESS_FILE):
+        return None
+    if time.time() - os.path.getmtime(SCAN_PROGRESS_FILE) > 90:
         return None
     try:
         with open(SCAN_PROGRESS_FILE, "r", encoding="utf-8") as f:
@@ -147,21 +151,29 @@ def plain_program_status(status, alive, sp, holding):
         return ("📉",
                 f"正在**盯守 {n} 个持仓**的“吊灯保护线”。程序每 **5 秒**用最新价核对一次："
                 f"价格越涨，保护线抬得越高（= 锁定浮盈）；一旦跌穿保护线，就**自动卖出止损**，不让亏损失控。")
-    # 空仓：看扫描进度
+    # 空仓：看扫描进度（sp 为 None = 无实时进度，回退到普通“运行中”说明）
     if sp:
         phase = sp.get("phase")
         if phase == "scanning":
             return ("🔎",
-                    f"当前**空仓**，正在扫描选币池 {sp.get('current', 0)}/{sp.get('total', 0)} 只币，"
-                    f"寻找“正在上涨、连续 4 根确认趋势”的下一个目标，找到就会自动买入。")
+                    f"当前**空仓**，正在评估选币池 {sp.get('current', 0)}/{sp.get('total', 0)} 只币的上涨趋势，"
+                    f"符合条件的**候选**会在连续确认后自动买入。")
         if phase == "done":
-            mm, ss = divmod(max(0, int(sp.get('next_ts', 0) - time.time())), 60)
+            remain = int(sp.get('next_ts', 0) - time.time())
+            found = sp.get('found', 0)
+            if remain <= 0:
+                return ("⏰",
+                        f"当前**空仓**。刚筛选出 **{found}** 只上涨趋势**候选**，已到新一轮评估时间点，"
+                        f"程序正在后台核对，符合条件的才真正买入。")
+            mm, ss = divmod(remain, 60)
             return ("⏳",
-                    f"当前**空仓**。上一轮从约 30 只选币池里找到 **{sp.get('found', 0)}** 只上涨趋势币；"
-                    f"距离下一轮扫描还有 **{mm:02d}:{ss:02d}**。找到仍在上涨的币就会自动买入。")
+                    f"当前**空仓**。上一轮筛出 **{found}** 只上涨趋势**候选币**（≠ 已买入，还需连续 4 根确认才开仓）；"
+                    f"距离下一轮评估还有 **{mm:02d}:{ss:02d}**，符合条件的会自动买入。")
         if phase == "error":
-            return ("⚠️", "上一轮扫描因接口异常失败，程序会稍后自动重试，无需你处理。")
-    return ("🛰️", "正在等待机器人开始扫描…（启动后约 1 分钟会进入状态）")
+            return ("⚠️", "上一轮开仓评估因接口异常失败，程序会稍后自动重试，无需你处理。")
+    return ("📡",
+            f"**运行中**。当前**空仓**，程序按固定节奏（每 15 分钟）在后台评估选币池里的上涨趋势，"
+            f"满足条件（上升趋势 + 连续 4 根确认）就自动买入；有持仓时每 5 秒自动盯守吊灯止损。")
 
 
 CONSOLE_LOG = os.path.join(BASE_DIR, "bot_console.log")
@@ -305,7 +317,7 @@ def status_section():
             elif phase == "error":
                 st.error("⚠️ 扫描失败（接口异常），下轮重试。")
         else:
-            st.caption("扫描进度暂无数据（机器人未启动或尚未开始扫描）。")
+            st.caption("当前无实时扫描进度条：程序在后台按固定节奏（每 15 分钟）评估开仓，状态以上方为准。")
         # ---------- 最近动态（机器人刚刚做了什么）----------
         acts = load_recent_actions()
         if acts:
