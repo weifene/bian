@@ -166,9 +166,10 @@ def get_position(symbol=None):
 
 
 def get_all_positions():
-    """返回当前所有非零持仓 {symbol: {"amt":,"entry":,"unrealized":,"side":}}"""
-    out = {}
+    """返回当前所有非零持仓 {symbol: {"amt":,"entry":,"unrealized":,"side":}}。
+    查询失败（网络/代理异常）返回 **None**，与"确实无持仓"的空 dict 严格区分——调用方据此避免误删本地持仓。"""
     try:
+        out = {}
         for p in client.futures_position_information():
             amt = float(p.get("positionAmt") or 0)
             if amt != 0 and p.get("symbol", "").endswith("USDT"):
@@ -178,9 +179,9 @@ def get_all_positions():
                     "unrealized": float(p.get("unRealizedProfit") or 0),
                     "side": "LONG" if amt > 0 else "SHORT",
                 }
+        return out
     except Exception:
-        pass
-    return out
+        return None
 
 
 def get_wallet_balance():
@@ -350,9 +351,11 @@ def try_open_entries(now, positions, trades, pool, confirm):
     """每 15 分钟评估一次：对选币池逐币，1h 趋势成立则累积确认根数，连续 CONF 根后仅做多开仓。
     已持仓不计入、达到 MAX_POS 或余额不足即停止。"""
     held = set(positions)
-    for sym, p in get_all_positions().items():
-        if p["side"] == "LONG":
-            held.add(sym)
+    act = get_all_positions()
+    if act:  # None(查询失败) 或 空 dict 都不额外加 held
+        for sym, p in act.items():
+            if p["side"] == "LONG":
+                held.add(sym)
     if len(held) >= MAX_POS:
         return
     # 本轮动态保证金 = 账户总资金 × 比例（同一轮各仓一致，避免循环中权益波动导致仓位忽大忽小）
@@ -402,12 +405,34 @@ def try_open_entries(now, positions, trades, pool, confirm):
 def manage_positions(now, positions, trades):
     """吊灯跟踪平仓：每仓追踪持仓期最高价 maxe，当前 15m 最低价跌破 maxe - K×ATR 即市价平仓。"""
     act = get_all_positions()
-    # 交易所已无仓位：同步移除本地记录（可能被外部平掉）
-    for sym in list(positions):
-        if sym not in act:
-            del positions[sym]
-            save_trades(trades, positions)
-            print(f"[{now}] [持仓] {sym} 交易所已无仓位，移除本地记录", flush=True)
+    if act is not None:
+        # 查询成功：只有交易所确实无某仓（本地却有）才移除本地记录
+        for sym in list(positions):
+            if sym not in act:
+                del positions[sym]
+                save_trades(trades, positions)
+                print(f"[{now}] [持仓] {sym} 交易所已无仓位，移除本地记录", flush=True)
+        # 反向接管：交易所有多单但本地没有 → 补建本地记录，恢复吊灯保护（如上次网络超时误删后）
+        for sym, ap in act.items():
+            if ap["side"] == "LONG" and sym not in positions:
+                try:
+                    hi, lo, cl = fetch_ohlc(sym, INTERVAL, ATR_N + 1)
+                    a = atr_simple(hi, lo, cl, ATR_N)
+                    px = float(ap["entry"])
+                    positions[sym] = {
+                        "time": now, "side": "LONG", "qty": float(ap["amt"]),
+                        "price": px, "cost": float(ap["amt"]) * px,
+                        "notional": float(ap["amt"]) * px, "order_type": "taker",
+                        "entry_fee": 0.0, "maxe": px, "atr": a, "confirm": 0,
+                    }
+                    save_trades(trades, positions)
+                    print(f"[{now}] [持仓] 接管交易所多单 {sym} ×{ap['amt']} @ {px:.6f}，恢复吊灯保护", flush=True)
+                except Exception as e:
+                    print(f"[{now}] [持仓] 接管 {sym} 失败：{e}", flush=True)
+    else:
+        # 查询失败（网络/代理异常）：保留本地记录继续监控，绝不误删
+        print(f"[{now}] [持仓] 交易所持仓查询失败，保留本地记录继续监控，本轮不清仓", flush=True)
+    act_amt = act or {}
     for sym, pos in list(positions.items()):
         try:
             hi, lo, cl = fetch_ohlc(sym, INTERVAL, ATR_N + 1)
@@ -422,7 +447,7 @@ def manage_positions(now, positions, trades):
             pos["trail"] = trail
             pos["trail_pct"] = (hi[-1] - trail) / trail * 100 if trail > 0 else 999.0
             if lo[-1] <= trail:
-                qty = abs(pos.get("qty") or act[sym]["amt"])
+                qty = abs(pos.get("qty") or act_amt.get(sym, {}).get("amt", 0))
                 fq, fp, _, fee = market_close_position(sym, qty, "LONG")
                 trades.append(make_close_record(pos, fq, fp, "taker", fee, "LONG", now, "吊灯止损"))
                 del positions[sym]
