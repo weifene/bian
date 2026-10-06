@@ -258,7 +258,8 @@ st.sidebar.caption("页面不再整页刷新：仅数据区域按此间隔局部
 
 # ================= 智能操作台 =================
 
-# 状态区（含吊灯止损距离）：bot.py 每 1 秒写 bot_status.json，这里按最高频每秒局部刷新
+# 状态区（含吊灯止损距离）：bot.py 每 5 秒写一次 bot_status.json（POLL_SECONDS=5）；
+# 看板每秒重绘，读到的新数字约每 5 秒跳一次（重绘高频是为了心跳/倒计时即时响应）
 STATUS_REFRESH_SEC = 1
 
 
@@ -407,9 +408,11 @@ def status_section():
             try:
                 pdl = pd.DataFrame([
                     {"币种": s, "方向": "做多", "数量": f"{p.get('qty', 0):.4f}",
-                     "开仓价": f"{p.get('price', 0):.6f}", "名义U": f"{p.get('notional', 0):.2f}",
-                     "吊灯保护线距离": (f"{p.get('trail_pct', 0):.0f}%" if p.get('trail_pct') is not None else "—"),
-                     "最新价": f"{p.get('last_px', 0):.6f}"}
+                     "开仓价": f"{p.get('price', 0):.6f}",
+                     "持仓最高价": f"{p.get('maxe', 0):.6f}",
+                     "吊灯线(跌破即卖)": f"{p.get('trail', 0):.6f}",
+                     "名义U": f"{p.get('notional', 0):.2f}",
+                     "吊灯距离": (f"{p.get('trail_pct', 0):.1f}%" if p.get('trail_pct') is not None else "—")}
                     for s, p in positions.items()
                 ])
                 st.markdown(f"**📦 当前持仓（{n_pos}）**")
@@ -418,12 +421,12 @@ def status_section():
             except Exception:
                 pass
         if positions and any(p.get("trail_pct") is not None for p in positions.values()):
-            trail_lines = []
-            for s, p in positions.items():
-                tp = p.get("trail_pct")
-                trail_lines.append(f"`{s}` 距吊灯线 **{tp:.0f}%**" if tp is not None else f"`{s}` —")
-            st.markdown(f"**📉 吊灯保护线距离**（逐仓）：{ '　'.join(trail_lines) }")
-            st.caption("吊灯线 = 持仓最高价 − 5×ATR；价格涨、线跟涨（锁浮盈），价格跌破线就自动市价止损。")
+            # 按距吊灯线由近到远排序（最危险的排最前）
+            items = [(s, p.get("trail_pct")) for s, p in positions.items() if p.get("trail_pct") is not None]
+            items.sort(key=lambda x: x[1])
+            trail_lines = [f"`{s}` 距吊灯线 **{tp:.1f}%**" for s, tp in items]
+            st.markdown(f"**📉 吊灯保护线距离**（约每 5 秒随最新价更新，越靠前越危险）：{'　'.join(trail_lines)}")
+            st.caption("吊灯线 = 持仓最高价 − 5×ATR；价格涨、线跟涨（锁浮盈），价格跌破线就自动市价止损。数字越接近 0 越可能下一秒被平仓。")
         if status.get("open_note"):
             note_txt = status.get("open_note", "")
             if "已开" in note_txt:
