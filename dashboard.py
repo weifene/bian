@@ -267,19 +267,10 @@ def status_section():
     """机器人状态卡片 + 程序控制（局部自动刷新）"""
     st.title("🤖 智能操作台")
 
-    # ---- 小白一句话讲清机器人怎么赚钱 ----
-    with st.expander("👶 一分钟看懂：它是怎么帮我在币圈赚钱的？（小白必看）", expanded=True):
-        st.markdown(
-            "这台程序帮你做**趋势跟随**，好比“**只坐上升的电梯，电梯一掉头就立刻下**”：\n\n"
-            "- **买什么**：只从**成交量最高的 30 只币**里挑，而且只买**正在上涨、连续 2 根确认上升趋势**的币，自动**市价买入**。\n"
-            "- **怎么赚**：买进后让它跟着趋势“**跑**”，涨得越高**越不急着卖**，让利润放大。\n"
-            "- **什么时候卖**：头顶挂一条“**吊灯保护线**”——价格越高、线抬得越高（等于**锁定浮盈**）；一旦价格掉头跌穿这条线，就**自动卖出止损**，不让亏损扩大。\n"
-            "- **仓位多大**：每只只投 **2U 保证金 × 3 倍杠杆**（约 6U），最多同时持 **8 只**，分散风险。\n"
-            "- **你要做什么**：几乎全是**全自动**——程序自己盯盘、自己买、自己止损。你只需偶尔回来看一眼本页。\n\n"
-            "⚠️ **风险提醒**：这是**真实资金 + 杠杆**自动交易，行情极端可能**强平**。请务必先用小金额验证。"
-        )
+    # 状态快照提前读取（策略卡需用当前余额估算动态仓位，下方状态区也复用同一变量）
+    status, alive = load_status()
 
-    # ---- 当前策略完整规则（参数实时读取 bot.py，永远与实盘一致）----
+    # ---- 读取实盘策略参数（实时解析 bot.py，两个折叠卡共用）----
     bp = read_bot_params()
     r2 = bp.get("R2_ENTRY", 0.85)
     sl = bp.get("SL_H", 0.0001)
@@ -293,13 +284,33 @@ def status_section():
     live_bal = float((status or {}).get("balance", 0) or 0)
     if margin_pct is not None:
         margin_now = live_bal * margin_pct
+        position_bullet = (
+            f"- **仓位多大**：每只用**总资金的 {margin_pct*100:.0f}% 做保证金 × {lev} 倍杠杆**"
+            f"（现在约 {margin_now:.1f}U 保证金），仓位随账户盈亏自动放大/缩小，最多同时持 **{int(bp.get('MAX_POS', 8))} 只**，分散风险。\n"
+        )
     else:
         margin_now = margin_fixed or 2.0
+        position_bullet = (
+            f"- **仓位多大**：每只只投 **{margin_now:g}U 保证金 × {lev} 倍杠杆**（约 {margin_now*lev:g}U），"
+            f"最多同时持 **{int(bp.get('MAX_POS', 8))} 只**，分散风险。\n"
+        )
     maxpos = int(bp.get("MAX_POS", 8))
     pooln = int(bp.get("VOL_POOL_N", 30))
     entry_min = int(bp.get("ENTRY_INTERVAL", 900)) // 60
     poll_s = int(bp.get("POLL_SECONDS", 5))
     fund = bp.get("FUNDING_RATE_LIMIT", 0.005)
+
+    # ---- 小白一句话讲清机器人怎么赚钱 ----
+    with st.expander("👶 一分钟看懂：它是怎么帮我在币圈赚钱的？（小白必看）", expanded=True):
+        st.markdown(
+            "这台程序帮你做**趋势跟随**，好比“**只坐上升的电梯，电梯一掉头就立刻下**”：\n\n"
+            f"- **买什么**：只从**成交量最高的 {pooln} 只币**里挑，而且只买**正在上涨、连续 {conf} 次确认上升趋势**的币，自动**市价买入**。\n"
+            "- **怎么赚**：买进后让它跟着趋势“**跑**”，涨得越高**越不急着卖**，让利润放大。\n"
+            "- **什么时候卖**：头顶挂一条“**吊灯保护线**”——价格越高、线抬得越高（等于**锁定浮盈**）；一旦价格掉头跌穿这条线，就**自动卖出止损**，不让亏损扩大。\n"
+            + position_bullet +
+            "- **你要做什么**：几乎全是**全自动**——程序自己盯盘、自己买、自己止损。你只需偶尔回来看一眼本页。\n\n"
+            "⚠️ **风险提醒**：这是**真实资金 + 杠杆**自动交易，行情极端可能**强平**。请务必先用小金额验证。"
+        )
 
     with st.expander(f"📋 当前策略完整规则（v4 趋势跟随·仅做多 ｜ 实时读取 bot.py，改代码这里自动同步）", expanded=False):
         st.markdown(
@@ -369,7 +380,6 @@ def status_section():
             .format(r2=r2, sl=sl, kk=kk, conf=conf)
         )
 
-    status, alive = load_status()
     sp = load_scan_progress()
     holding = status.get("position", "") not in ("", "空仓")
 
