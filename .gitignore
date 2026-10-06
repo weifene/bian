@@ -15,5 +15,6 @@ scan_progress.json
 scan_window.json
 open_request.json
 stop_request.flag
+bot.lock
 scan_queue_snapshot.json
 top20_pool.json

@@ -77,6 +77,7 @@ MAKER_FEE_RATE = 0.0002                             # 挂单成交（maker）手
 # ---- 文件 ----
 STATUS_FILE = r"d:\bian\bot_status.json"            # 轮询写入运行状态快照（界面状态显示与心跳检测）
 STOP_FILE = r"d:\bian\stop_request.flag"            # 界面"停止程序"按钮：存在此文件优雅退出
+LOCK_FILE = r"d:\bian\bot.lock"                     # 单实例锁：写入当前 PID，防止两个 bot 并发重复下单
 VOL_POOL_FILE  = VOL_POOL_FILE
 TRADE_LOG = os.path.join(os.path.dirname(__file__), "trade_log.json")  # 交易记录（含持仓）
 PNL_LOG = os.path.join(os.path.dirname(__file__), "pnl_history.json")   # 分时盈亏记录
@@ -515,7 +516,50 @@ def market_close_position(symbol, qty, position_side):
 
 # ---------------- 主循环 ----------------
 
+def _pid_alive(pid):
+    """Windows：判断某 PID 是否仍有进程存活（OpenProcess 能打开句柄即存活）。"""
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        h = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return False
+        kernel32.CloseHandle(h)
+        return True
+    except Exception:
+        return True  # 检测失败时保守视为占用，宁可少开也不并发两个
+
+
+def acquire_singleton():
+    """单实例锁：锁文件里记录的旧 PID 仍存活时，本实例直接退出，杜绝两个 bot 并发重复下单。
+    正常退出经 atexit 删锁；崩溃残留的锁由 PID 存活检测兜底（旧 PID 已不在则自动接管）。"""
+    import atexit
+    if os.path.exists(LOCK_FILE):
+        try:
+            with open(LOCK_FILE, "r", encoding="utf-8") as f:
+                old = int(f.read().strip())
+        except Exception:
+            old = 0
+        if old and old != os.getpid() and _pid_alive(old):
+            print(f"检测到已有 bot.py 实例运行中（PID {old}），本实例自动退出以避免并发重复下单。"
+                  f"如需重启，请先在看板点“停止程序”或结束旧进程。", flush=True)
+            sys.exit(0)
+    with open(LOCK_FILE, "w", encoding="utf-8") as f:
+        f.write(str(os.getpid()))
+
+    def _release():
+        try:
+            if os.path.exists(LOCK_FILE):
+                with open(LOCK_FILE, "r", encoding="utf-8") as f:
+                    if f.read().strip() == str(os.getpid()):
+                        os.remove(LOCK_FILE)
+        except Exception:
+            pass
+    atexit.register(_release)
+
+
 def main():
+    acquire_singleton()   # 单实例保护：已有 bot 在跑则直接退出，防止并发重复下单
     trades, positions, _saved = load_trades()
     print(f"机器人启动 | v4 趋势跟随·仅多 | 成交量前{VOL_POOL_N}·吊灯K{K}×ATR·确认{CONF}根 | 每仓 {POS_MARGIN_USDT:.0f}U×{LEVERAGE}x=(名义{POS_MARGIN_USDT*LEVERAGE:.0f}U) | 最多{MAX_POS}仓 | 每{ENTRY_INTERVAL//60}分钟评估开仓 | reason=吊灯止损")
     print(f"合约钱包 USDT 余额: {get_wallet_balance():.2f} | 历史已平仓 {len(trades)} 笔 | 当前持仓 {len(positions)} 个")
