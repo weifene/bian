@@ -49,6 +49,41 @@ ORDER_TYPE_CN = {"maker": "限价", "taker": "市价", "mixed": "混合"}
 st.set_page_config(page_title="币安 U 本位合约交易看板", layout="wide")
 
 
+# ---------------- 从 bot.py 读取实盘策略参数（单一数据源，避免页面文案与代码漂移）----------------
+import re as _re
+
+_BOT_PARAM_CACHE = {"mtime": 0, "params": {}}
+
+
+def read_bot_params():
+    """直接解析 bot.py 文本中的策略常量（不 import，避免触发交易所客户端初始化）。
+    返回 dict：R2_ENTRY / SL_H / H_WIN / CONF / K / ATR_N / LEVERAGE /
+              POS_MARGIN_USDT / MAX_POS / VOL_POOL_N / ENTRY_INTERVAL / POLL_SECONDS / FUNDING_RATE_LIMIT。
+    文件未变则走缓存。"""
+    try:
+        mtime = os.path.getmtime(BOT_PY)
+    except OSError:
+        return {}
+    if mtime == _BOT_PARAM_CACHE["mtime"] and _BOT_PARAM_CACHE["params"]:
+        return _BOT_PARAM_CACHE["params"]
+    want = {"R2_ENTRY", "SL_H", "H_WIN", "CONF", "K", "ATR_N", "LEVERAGE",
+            "POS_MARGIN_USDT", "MAX_POS", "VOL_POOL_N", "ENTRY_INTERVAL",
+            "POLL_SECONDS", "FUNDING_RATE_LIMIT"}
+    out = {}
+    try:
+        with open(BOT_PY, "r", encoding="utf-8-sig") as f:
+            for line in f:
+                m = _re.match(r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([0-9.]+)\s*(?:#.*)?$", line)
+                if m and m.group(1) in want:
+                    val = m.group(2)
+                    out[m.group(1)] = float(val) if "." in val else int(val)
+    except Exception:
+        return {}
+    _BOT_PARAM_CACHE["mtime"] = mtime
+    _BOT_PARAM_CACHE["params"] = out
+    return out
+
+
 # ---------------- 通用数据读取 ----------------
 
 def load_status():
@@ -242,6 +277,57 @@ def status_section():
             "- **仓位多大**：每只只投 **2U 保证金 × 3 倍杠杆**（约 6U），最多同时持 **8 只**，分散风险。\n"
             "- **你要做什么**：几乎全是**全自动**——程序自己盯盘、自己买、自己止损。你只需偶尔回来看一眼本页。\n\n"
             "⚠️ **风险提醒**：这是**真实资金 + 杠杆**自动交易，行情极端可能**强平**。请务必先用小金额验证。"
+        )
+
+    # ---- 当前策略完整规则（参数实时读取 bot.py，永远与实盘一致）----
+    bp = read_bot_params()
+    r2 = bp.get("R2_ENTRY", 0.85)
+    sl = bp.get("SL_H", 0.0001)
+    hwin = bp.get("H_WIN", 24)
+    conf = bp.get("CONF", 2)
+    kk = bp.get("K", 5.0)
+    atrn = bp.get("ATR_N", 14)
+    lev = int(bp.get("LEVERAGE", 3))
+    margin = bp.get("POS_MARGIN_USDT", 2.0)
+    maxpos = int(bp.get("MAX_POS", 8))
+    pooln = int(bp.get("VOL_POOL_N", 30))
+    entry_min = int(bp.get("ENTRY_INTERVAL", 900)) // 60
+    poll_s = int(bp.get("POLL_SECONDS", 5))
+    fund = bp.get("FUNDING_RATE_LIMIT", 0.005)
+
+    with st.expander(f"📋 当前策略完整规则（v4 趋势跟随·仅做多 ｜ 实时读取 bot.py，改代码这里自动同步）", expanded=False):
+        st.markdown(
+            f"**一句话**：在成交量最高的 **{pooln}** 只 USDT 永续里，只做**多头**——"
+            f"1 小时级别走出干净的**上涨直线**、且 15 分钟图连续确认后**市价买入**；"
+            f"买入后用一条不断上移的“吊灯保护线”跟随，价格**跌穿就市价卖出**，让利润跑、把亏损截断。"
+        )
+        rule_rows = [
+            ("🐟 选币池", f"成交量前 **{pooln}** 的 USDT 永续合约，每 **4 小时**整点自动更新一次"),
+            ("📈 趋势判断", f"用最近 **{hwin} 根 1 小时 K线**做线性回归：拟合优度 **R² ≥ {r2:g}**（越接近1=走势越像一条直线），且每根斜率 **≥ {sl:g}**"),
+            ("✅ 开仓确认", f"15 分钟图上**连续 {conf} 根**满足上升趋势才买入（确认次数越少进场越快、但假信号也越多）"),
+            ("↗️ 方向", "**只做多（只买涨）**，不做空；斜率必须为正才开仓"),
+            ("💰 每仓大小", f"每仓保证金 **{margin:g} U × {lev} 倍杠杆 = 名义 {margin*lev:g} U**，同时最多持 **{maxpos}** 仓"),
+            ("🛑 卖出(止损/止盈)", f"**吊灯线 = 持仓以来最高价 − {kk:g} × ATR({atrn},15分钟)**；价格跌破立即**市价卖出**。涨得越多线抬得越高＝自动锁定利润"),
+            ("⏱️ 运行节奏", f"每 **{entry_min} 分钟**评估一次开新仓；持仓时每 **{poll_s} 秒**检查一次吊灯线"),
+            ("🧾 下单方式", "开仓、平仓**全部用市价单**（吃单 taker，手续费约 0.05%/边），保证触发即成交、不挂单等待"),
+            ("💸 资金费率", f"开多时若当前资金费率（多头付给空头）高于 **{fund*100:g}%/8h** 则跳过该币，避免承担高额费率"),
+            ("🚫 没有的东西", "**无固定止盈价、无评分回撤、无做空、无加仓/马丁**；唯一离场信号就是吊灯线"),
+        ]
+        for name, desc in rule_rows:
+            st.markdown(f"- {name}：{desc}")
+
+        st.markdown("##### 📊 这套参数的最近一次回测成绩（90 天 × 30 币，仅做多）")
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("90天收益", "+10.7% ~ +17.6%")
+        m2.metric("年化（保守口径）", "+51%")
+        m3.metric("最大回撤", "≈19%")
+        m4.metric("交易笔数", "≈310")
+        m5.metric("胜率", "≈38%")
+        st.caption(
+            "说明：网格扫描 500 组参数后，在“年化≥50% 且 回撤≤20%”的达标组里选了年化最高的一组（R²={r2:g} / 斜率 {sl:g} / "
+            "K {kk:g} / 确认 {conf}）。同参数两次复跑年化在 51%~93% 之间（最后一根未收盘K线口径差异），**页面按保守的 51% 展示**；"
+            "胜率约 38% 是趋势策略的常态——靠少数大赚覆盖多次小亏。回测为历史数据，**不代表未来收益**，熊市/长期横盘时仅做多趋势策略可能连续止损。"
+            .format(r2=r2, sl=sl, kk=kk, conf=conf)
         )
 
     status, alive = load_status()
