@@ -417,7 +417,7 @@ def write_status(now, realized, floating, total, signal_str, positions, cand_cou
         "position": "\n".join(f"{s}:{p.get('side','?')}" for s, p in positions.items()) or "空仓",
         "positions": positions,
         "candidate_count": cand_count,
-        "strategy": "v4趋势跟随·仅多·吊灯K6×ATR",
+        "strategy": f"v4趋势跟随·仅多·吊灯K{K:g}×ATR·确认{CONF}根·R²{R2_ENTRY:g}",
         "open_note": "",
         "open_note_time": "",
     }
