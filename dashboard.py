@@ -2,12 +2,12 @@
 币安 U 本位合约量化交易 - 可视化看板
 
 页面：
-  - 智能操作台：机器人状态 / 全市场"干净趋势"扫描 Top10 展示 / 选择币种开仓（全仓，确认后立即执行） / 停止与启动机器人 / 恢复自动交易
+  - 智能操作台：机器人状态 / 选币池与趋势信号展示 / 自动开仓（每仓2U×3x=6U，最多8仓） / 停止与启动机器人
   - 账户分析：盈亏概览 / 分时盈亏曲线 / 交易明细 / 手续费统计
 
 与 bot.py 通过文件通信：
   - 读：bot_status.json（状态快照）、scan_results.json（扫描 Top N）、trade_log.json / pnl_history.json
-  - 写：open_request.json（开仓请求）、stop_request.flag（停止）
+  - 写：stop_request.flag（停止）
 
 性能：使用 st.fragment(run_every=...) 局部自动刷新（仅数据区定时重绘），
 不再用 JS 整页刷新，交互不卡顿、所选币种不会被刷新重置。
@@ -101,7 +101,8 @@ def load_scan_progress():
 
 
 def write_open_request(sym, side, price, score):
-    """向机器人发送开仓请求（含方向/价格/评分，机器人确认后立即全仓开单，不再复核趋势门槛）"""
+    """向机器人发送开仓请求（含方向/价格/评分，机器人按请求对指定币种开多，
+    每仓 2U×3x=6U 名义，最多 8 仓；当前 v4 已为全自动开仓，此接口暂未使用）"""
     with open(OPEN_REQUEST_FILE, "w", encoding="utf-8") as f:
         json.dump({"symbol": sym, "side": side, "price": price, "score": score,
                    "time": time.strftime("%Y-%m-%d %H:%M:%S")}, f, ensure_ascii=False, indent=2)
@@ -222,7 +223,7 @@ st.sidebar.caption("页面不再整页刷新：仅数据区域按此间隔局部
 
 # ================= 智能操作台 =================
 
-# 状态区（含评分回撤进度）：bot.py 每 1 秒写 bot_status.json，这里按最高频每秒局部刷新
+# 状态区（含吊灯止损距离）：bot.py 每 1 秒写 bot_status.json，这里按最高频每秒局部刷新
 STATUS_REFRESH_SEC = 1
 
 
