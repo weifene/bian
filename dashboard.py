@@ -282,7 +282,7 @@ def status_section():
     lev = int(bp.get("LEVERAGE", 3))
     margin_pct = bp.get("POS_MARGIN_PCT")          # 新版：占总资金比例（动态）
     margin_fixed = bp.get("POS_MARGIN_USDT")       # 旧版兼容：固定 U 数
-    live_bal = float((status or {}).get("balance", 0) or 0)
+    live_bal = float((status or {}).get("equity") or (status or {}).get("balance", 0) or 0)
     if margin_pct is not None:
         margin_now = live_bal * margin_pct
         position_bullet = (
@@ -397,7 +397,11 @@ def status_section():
     n_pos = len(positions)
     c2.metric("持仓数", f"{n_pos}" if alive else "—")
     c3.metric("持仓方向", (status.get("position") or "空仓").replace("\n", " | ") if alive else "—")
-    c4.metric("余额 (USDT)", f"{status.get('balance', 0):.2f}" if alive else "—")
+    equity = float((status or {}).get("equity") or (status or {}).get("balance", 0) or 0) if alive else 0.0
+    c4.metric("账户权益 (USDT)", f"{equity:.2f}" if alive else "—")
+    if alive:
+        _wb = (status or {}).get("wallet_balance", status.get("balance", 0) if status else 0)
+        c4.caption(f"钱包余额 {float(_wb or 0):.2f}｜含浮动盈亏 {float((status or {}).get('floating', 0) or 0):+.2f}")
     c5.metric("总盈亏 (USDT)", f"{status.get('total', 0):+.2f}" if alive else "—")
     c6.metric("已实现盈亏", f"{status.get('realized', 0):+.2f}" if alive else "—")
     st.caption("提示：总盈亏 = 已实现（已卖出落袋的钱）+ 浮动（还没卖、跟着行情浮动的钱）。")

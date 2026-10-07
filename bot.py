@@ -464,7 +464,9 @@ def write_status(now, realized, floating, total, signal_str, positions, cand_cou
     st_data = {
         "time": now,
         "symbol": SYMBOL,
-        "balance": get_wallet_balance(),
+        "wallet_balance": get_wallet_balance(),      # 钱包余额：不随浮亏变化，仅平仓后变
+        "equity": get_account_equity(),              # 账户权益=钱包余额+浮动盈亏，实时随持仓浮盈变化
+        "balance": get_wallet_balance(),             # 兼容字段：原始钱包余额
         "realized": realized,
         "floating": floating,
         "total": total,
